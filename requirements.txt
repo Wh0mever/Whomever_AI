@@ -1,29 +1,69 @@
+# Основные зависимости для WHOMEVER бота
 aiogram>=3.0.0
 aiohttp>=3.8.0
 backoff>=2.2.0
-openai>=1.0.0
+openai>=1.55.0
 python-dotenv>=0.19.0
 aiofiles>=23.1.0
-beautifulsoup4>=4.12.0
 requests>=2.31.0
-python-magic>=0.4.27
-PyPDF2>=3.0.0
-python-docx>=0.8.11
-pydub>=0.25.1
-ffmpeg-python>=0.2.0
-Pillow>=10.0.0
-python-magic-bin>=0.4.14; platform_system == 'Windows'
-redis>=5.0.0
-cachetools>=5.3.0
-aioredis>=2.0.0
-python-jose>=3.3.0
-cryptography>=41.0.0
-pydantic>=2.0.0
-fastapi>=0.100.0
-uvicorn>=0.22.0
-python-multipart>=0.0.6
-moviepy>=1.0.3
 aiosqlite>=0.19.0
 asyncio>=3.4.3
 typing-extensions>=4.7.0
-yarl>=1.9.2 
+
+# Обработка файлов
+PyMuPDF>=1.24.0
+PyPDF2>=3.0.0
+python-docx>=0.8.11
+Pillow>=10.0.0
+python-magic>=0.4.27
+python-magic-bin>=0.4.14; platform_system == 'Windows'
+
+# Аудио/видео обработка
+pydub>=0.25.1
+ffmpeg-python>=0.2.0
+moviepy>=1.0.3
+wave>=0.0.2
+pyaudio>=0.2.11
+
+# Веб-парсинг и поиск
+beautifulsoup4>=4.12.0
+duckduckgo-search>=4.0.0
+
+# WebSocket и WebRTC для Real-time API
+websockets>=12.0
+aiortc>=1.6.0
+websocket-client>=1.6.4
+sounddevice>=0.4.6
+
+# OpenAI Real-time API поддержка  
+openai[realtime]>=1.55.0
+
+# Дополнительные утилиты
+cachetools>=5.3.0
+yarl>=1.9.2
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Безопасность и аутентификация
+cryptography>=41.0.0
+pydantic>=2.0.0
+
+# JSON и структурированные данные
+jsonschema>=4.18.0
+orjson>=3.9.0
+
+# Асинхронность и многопоточность
+uvloop>=0.17.0; platform_system != 'Windows'
+asyncio-throttle>=1.0.2
+
+# Мониторинг и логирование
+psutil>=5.9.0
+structlog>=23.1.0
+
+# Опциональные зависимости для расширенного функционала
+# redis>=5.0.0
+# aioredis>=2.0.0
+# python-jose>=3.3.0
+# fastapi>=0.100.0
+# uvicorn>=0.22.0
+# python-multipart>=0.0.6 

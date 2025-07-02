@@ -1,152 +1,288 @@
 import aiohttp
 import asyncio
 import logging
-import backoff
+import json
 from typing import List, Dict, Any, Optional
-from config import FETCHSERP_API_KEY, FETCHSERP_SETTINGS, SEARCH_SETTINGS
+from urllib.parse import quote_plus
+import re
+from bs4 import BeautifulSoup
+from config import SEARCH_SETTINGS
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class SearchAPI:
     def __init__(self):
-        self.api_key = FETCHSERP_API_KEY
-        self.base_url = FETCHSERP_SETTINGS['base_url']
+        self.timeout = SEARCH_SETTINGS.get('timeout', 10)
+        self.max_results = SEARCH_SETTINGS.get('max_results', 5)
+        self.user_agent = SEARCH_SETTINGS.get('user_agent', 'WHOMEVER AI Bot 2.0')
         self.headers = {
-            "accept": "application/json",
-            "authorization": f"Bearer {self.api_key}"
+            'User-Agent': self.user_agent,
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'ru,en;q=0.5',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive',
         }
-        self.semaphore = asyncio.Semaphore(FETCHSERP_SETTINGS['rate_limit']['max_concurrent'])
 
-    @backoff.on_exception(
-        backoff.expo,
-        (aiohttp.ClientError, asyncio.TimeoutError),
-        max_tries=FETCHSERP_SETTINGS['max_retries']
-    )
-    async def _make_request(self, endpoint: str, params: Dict[str, Any]) -> Dict:
-        """Выполнение запроса к API с повторными попытками"""
-        async with self.semaphore:
-            timeout = aiohttp.ClientTimeout(total=FETCHSERP_SETTINGS['timeout'])
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                url = f"{self.base_url}{endpoint}"
-                async with session.get(url, params=params, headers=self.headers) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    else:
-                        error_text = await response.text()
-                        logger.error(f"Ошибка API: {response.status} - {error_text}")
-                        raise aiohttp.ClientError(f"Ошибка API: {response.status}")
-
-    async def search(
-        self,
-        query: str,
-        engine: str = SEARCH_SETTINGS['default_engine'],
-        country: str = SEARCH_SETTINGS['default_country'],
-        pages: int = 1
-    ) -> List[Dict]:
-        """Поиск по запросу"""
-        params = {
-            "search_engine": engine,
-            "country": country,
-            "pages_number": min(pages, SEARCH_SETTINGS['max_pages']),
-            "query": query
-        }
-        
+    async def search(self, query: str, engine: str = 'duckduckgo', **kwargs) -> List[Dict]:
+        """Поиск с использованием различных поисковых движков"""
         try:
-            data = await self._make_request(FETCHSERP_SETTINGS['endpoints']['search'], params)
-            return self._format_search_results(data)
+            if engine == 'duckduckgo':
+                return await self._duckduckgo_search(query)
+            elif engine == 'google':
+                return await self._google_search(query)
+            else:
+                logger.warning(f"Неподдерживаемый поисковый движок: {engine}")
+                return await self._duckduckgo_search(query)  # Fallback
         except Exception as e:
-            logger.error(f"Ошибка при поиске: {str(e)}")
+            logger.error(f"Ошибка поиска через {engine}: {str(e)}")
+            # Пробуем альтернативный движок
+            if engine != 'duckduckgo':
+                return await self._duckduckgo_search(query)
             return []
 
-    async def get_ranking(
-        self,
-        domain: str,
-        query: str,
-        engine: str = SEARCH_SETTINGS['default_engine'],
-        country: str = SEARCH_SETTINGS['default_country']
-    ) -> Optional[int]:
-        """Получение позиции домена в выдаче"""
-        params = {
-            "search_engine": engine,
-            "country": country,
-            "domain": domain,
-            "query": query
-        }
-        
+    async def _duckduckgo_search(self, query: str) -> List[Dict]:
+        """Поиск через DuckDuckGo Instant Answer API"""
         try:
-            data = await self._make_request(FETCHSERP_SETTINGS['endpoints']['ranking'], params)
-            return data.get('ranking')
-        except Exception as e:
-            logger.error(f"Ошибка при получении позиции: {str(e)}")
-            return None
-
-    async def get_web_pages(
-        self,
-        query: str,
-        engine: str = SEARCH_SETTINGS['default_engine'],
-        country: str = SEARCH_SETTINGS['default_country'],
-        pages: int = 1
-    ) -> List[Dict]:
-        """Получение полного содержимого страниц из результатов поиска"""
-        params = {
-            "search_engine": engine,
-            "country": country,
-            "pages_number": min(pages, SEARCH_SETTINGS['max_pages']),
-            "query": query
-        }
-        
-        try:
-            data = await self._make_request(FETCHSERP_SETTINGS['endpoints']['web_pages'], params)
-            return data.get('results', [])
-        except Exception as e:
-            logger.error(f"Ошибка при получении страниц: {str(e)}")
-            return []
-
-    async def get_suggestions(
-        self,
-        query: str,
-        country: str = SEARCH_SETTINGS['default_country'],
-        url: Optional[str] = None
-    ) -> List[Dict]:
-        """Получение поисковых подсказок"""
-        params = {
-            "country": country,
-            "keywords": [query]
-        }
-        if url:
-            params["url"] = url
+            # Сначала пробуем Instant Answer API
+            instant_results = await self._duckduckgo_instant(query)
+            if instant_results:
+                return instant_results
             
-        try:
-            data = await self._make_request(FETCHSERP_SETTINGS['endpoints']['suggestions'], params)
-            return data.get('keywords_suggestions', [])
+            # Если нет мгновенных ответов, парсим веб-результаты
+            return await self._duckduckgo_web_search(query)
+            
         except Exception as e:
-            logger.error(f"Ошибка при получении подсказок: {str(e)}")
+            logger.error(f"Ошибка DuckDuckGo поиска: {str(e)}")
             return []
 
-    def _format_search_results(self, data: Dict) -> List[Dict]:
-        """Форматирование результатов поиска"""
-        results = []
-        for item in data:
-            result = {
-                'title': item.get('title', ''),
-                'url': item.get('url', ''),
-                'description': item.get('description', ''),
-                'position': item.get('ranking', 0)
+    async def _duckduckgo_instant(self, query: str) -> List[Dict]:
+        """DuckDuckGo Instant Answer API"""
+        try:
+            url = f"https://api.duckduckgo.com/"
+            params = {
+                'q': query,
+                'format': 'json',
+                'no_redirect': '1',
+                'no_html': '1',
+                'skip_disambig': '1'
             }
-            results.append(result)
-        return results
+            
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            async with aiohttp.ClientSession(timeout=timeout, headers=self.headers) as session:
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        results = []
+                        
+                        # Добавляем абстракт если есть
+                        if data.get('Abstract'):
+                            results.append({
+                                'title': data.get('Heading', query),
+                                'url': data.get('AbstractURL', ''),
+                                'description': data.get('Abstract', ''),
+                                'source': 'DuckDuckGo Instant'
+                            })
+                        
+                        # Добавляем связанные темы
+                        for topic in data.get('RelatedTopics', [])[:3]:
+                            if isinstance(topic, dict) and 'Text' in topic:
+                                results.append({
+                                    'title': topic.get('Text', '')[:100],
+                                    'url': topic.get('FirstURL', ''),
+                                    'description': topic.get('Text', ''),
+                                    'source': 'DuckDuckGo Related'
+                                })
+                        
+                        return results[:self.max_results]
+                        
+        except Exception as e:
+            logger.error(f"Ошибка DuckDuckGo Instant API: {str(e)}")
+        
+        return []
 
-    def _format_web_page_results(self, data: Dict) -> List[Dict]:
-        """Форматирование результатов с содержимым страниц"""
-        results = []
-        for item in data.get('results', []):
-            result = {
-                'title': item.get('title', ''),
-                'url': item.get('url', ''),
-                'description': item.get('description', ''),
-                'content': item.get('content', ''),
-                'position': item.get('ranking', 0)
+    async def _duckduckgo_web_search(self, query: str) -> List[Dict]:
+        """Веб-поиск через DuckDuckGo (парсинг результатов)"""
+        try:
+            # Первый запрос для получения токена
+            url = "https://html.duckduckgo.com/html/"
+            params = {'q': query}
+            
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            async with aiohttp.ClientSession(timeout=timeout, headers=self.headers) as session:
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        html = await response.text()
+                        return self._parse_duckduckgo_results(html)
+                        
+        except Exception as e:
+            logger.error(f"Ошибка DuckDuckGo веб-поиска: {str(e)}")
+        
+        return []
+
+    def _parse_duckduckgo_results(self, html: str) -> List[Dict]:
+        """Парсинг результатов DuckDuckGo"""
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            results = []
+            
+            # Находим результаты поиска
+            result_divs = soup.find_all('div', class_='result')
+            
+            for div in result_divs[:self.max_results]:
+                try:
+                    # Заголовок и ссылка
+                    title_link = div.find('a', class_='result__a')
+                    if not title_link:
+                        continue
+                    
+                    title = title_link.get_text(strip=True)
+                    url = title_link.get('href', '')
+                    
+                    # Описание
+                    snippet_div = div.find('a', class_='result__snippet')
+                    description = snippet_div.get_text(strip=True) if snippet_div else ''
+                    
+                    if title and url:
+                        results.append({
+                            'title': title,
+                            'url': url,
+                            'description': description,
+                            'source': 'DuckDuckGo Web'
+                        })
+                        
+                except Exception as e:
+                    logger.debug(f"Ошибка парсинга результата: {str(e)}")
+                    continue
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Ошибка парсинга DuckDuckGo: {str(e)}")
+            return []
+
+    async def _google_search(self, query: str) -> List[Dict]:
+        """Простой поиск через Google (без API ключа)"""
+        try:
+            # Используем Google Custom Search без ключа (ограниченно)
+            url = "https://www.google.com/search"
+            params = {
+                'q': query,
+                'num': self.max_results,
+                'hl': 'ru',
+                'lr': 'lang_ru'
             }
-            results.append(result)
-        return results 
+            
+            timeout = aiohttp.ClientTimeout(total=self.timeout)
+            async with aiohttp.ClientSession(timeout=timeout, headers=self.headers) as session:
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        html = await response.text()
+                        return self._parse_google_results(html)
+                        
+        except Exception as e:
+            logger.error(f"Ошибка Google поиска: {str(e)}")
+        
+        return []
+
+    def _parse_google_results(self, html: str) -> List[Dict]:
+        """Парсинг результатов Google"""
+        try:
+            soup = BeautifulSoup(html, 'html.parser')
+            results = []
+            
+            # Ищем div'ы с результатами
+            search_results = soup.find_all('div', class_='g')
+            
+            for result in search_results[:self.max_results]:
+                try:
+                    # Заголовок и ссылка
+                    title_elem = result.find('h3')
+                    if not title_elem:
+                        continue
+                    
+                    link_elem = result.find('a')
+                    if not link_elem:
+                        continue
+                    
+                    title = title_elem.get_text(strip=True)
+                    url = link_elem.get('href', '')
+                    
+                    # Убираем Google редирект
+                    if url.startswith('/url?'):
+                        url_match = re.search(r'url=([^&]+)', url)
+                        if url_match:
+                            url = url_match.group(1)
+                    
+                    # Описание
+                    snippet_spans = result.find_all('span')
+                    description = ''
+                    for span in snippet_spans:
+                        text = span.get_text(strip=True)
+                        if len(text) > 50:  # Вероятно это описание
+                            description = text
+                            break
+                    
+                    if title and url and url.startswith('http'):
+                        results.append({
+                            'title': title,
+                            'url': url,
+                            'description': description,
+                            'source': 'Google'
+                        })
+                        
+                except Exception as e:
+                    logger.debug(f"Ошибка парсинга Google результата: {str(e)}")
+                    continue
+            
+            return results
+            
+        except Exception as e:
+            logger.error(f"Ошибка парсинга Google: {str(e)}")
+            return []
+
+    async def get_suggestions(self, query: str) -> List[Dict]:
+        """Получение поисковых подсказок"""
+        try:
+            # Используем Google Suggest API
+            url = "http://suggestqueries.google.com/complete/search"
+            params = {
+                'client': 'firefox',
+                'q': query,
+                'hl': 'ru'
+            }
+            
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        suggestions = []
+                        
+                        if len(data) > 1 and isinstance(data[1], list):
+                            for suggestion in data[1][:5]:
+                                suggestions.append({
+                                    'keyword': suggestion,
+                                    'source': 'Google Suggest'
+                                })
+                        
+                        return suggestions
+                        
+        except Exception as e:
+            logger.error(f"Ошибка получения подсказок: {str(e)}")
+        
+        return []
+
+    async def get_news(self, query: str) -> List[Dict]:
+        """Получение новостей по запросу"""
+        try:
+            # Поиск новостей через DuckDuckGo с модификатором
+            news_query = f"{query} новости"
+            return await self.search(news_query, engine='duckduckgo')
+        except Exception as e:
+            logger.error(f"Ошибка поиска новостей: {str(e)}")
+            return []
+
+    def is_available(self) -> bool:
+        """Проверка доступности поискового API"""
+        return True  # Всегда доступен, так как не требует API ключей 
