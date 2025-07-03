@@ -38,7 +38,7 @@ except ImportError:
     logger = logging.getLogger(__name__)
     logger.warning("⚠️ SearchAPI недоступен")
 
-logging.basicConfig(level=logging.INFO)
+# Логирование настроено в run_bot.py
 logger = logging.getLogger(__name__)
 
 class OpenAIAPI:

@@ -229,9 +229,16 @@ class BotExtensions2025:
                 if response:
                     # Создаем голосовой ответ
                     user_settings = await self.db.get_user_settings(user_id)
-                    voice = user_settings[4] if user_settings and len(user_settings) > 4 else "alloy"
+                    if user_settings and len(user_settings) >= 5:
+                        voice = user_settings[4]  # voice_preference в позиции [4]
+                    else:
+                        voice = "alloy"
                     
-                    # Отправляем голосовой ответ
+                    # Валидация голоса
+                    valid_voices = self.api.get_available_voices()
+                    if voice not in valid_voices:
+                        voice = "alloy"
+                        
                     await self.send_voice_response(message, response, voice)
                     
                     # Также отправляем текст для контроля
@@ -265,7 +272,15 @@ class BotExtensions2025:
             if response:
                 # Получаем настройки голоса
                 user_settings = await self.db.get_user_settings(user_id)
-                voice = user_settings[4] if user_settings and len(user_settings) > 4 else "alloy"
+                if user_settings and len(user_settings) >= 5:
+                    voice = user_settings[4]  # voice_preference в позиции [4]
+                else:
+                    voice = "alloy"
+                
+                # Валидация голоса
+                valid_voices = self.api.get_available_voices()
+                if voice not in valid_voices:
+                    voice = "alloy"
                 
                 # Отправляем голосовой ответ
                 await self.send_voice_response(message, response, voice)
@@ -414,7 +429,10 @@ class BotExtensions2025:
                     
                     # Создаем голосовой ответ
                     user_settings = await self.db.get_user_settings(user_id)
-                    voice = user_settings[4] if user_settings and len(user_settings) > 4 else "alloy"
+                    if user_settings and len(user_settings) >= 5:
+                        voice = user_settings[4]  # voice_preference в позиции [4]
+                    else:
+                        voice = "alloy"
                     await self.send_voice_response(message, response, voice)
                 
                 # Сохраняем в историю

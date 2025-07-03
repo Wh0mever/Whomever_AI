@@ -4,6 +4,9 @@ import json
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
 from config import DATABASE_NAME
+import logging
+
+logger = logging.getLogger(__name__)
 
 class Database:
     def __init__(self):
@@ -30,6 +33,7 @@ class Database:
             communication_style TEXT DEFAULT 'formal',
             analysis_depth TEXT DEFAULT 'detailed',
             language TEXT DEFAULT 'ru',
+            voice_preference TEXT DEFAULT 'alloy',
             personality_profile TEXT DEFAULT '{}',
             is_founder BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -158,9 +162,9 @@ class Database:
         """Получение настроек пользователя"""
         async with aiosqlite.connect(self.db_path) as conn:
             cursor = await conn.execute('''
-            SELECT current_character, communication_style, analysis_depth, language, is_founder
-        FROM users WHERE user_id = ?
-        ''', (user_id,))
+            SELECT current_character, communication_style, analysis_depth, language, voice_preference, is_founder
+            FROM users WHERE user_id = ?
+            ''', (user_id,))
             return await cursor.fetchone()
 
     async def update_user_settings(self, user_id: int, **settings):
@@ -422,3 +426,25 @@ class Database:
         """Закрытие всех соединений (заглушка для совместимости)"""
         # aiosqlite автоматически закрывает соединения при выходе из контекста
         pass 
+
+    async def migrate_add_voice_preference(self):
+        """Миграция: добавление колонки voice_preference если её нет"""
+        async with aiosqlite.connect(self.db_path) as conn:
+            try:
+                # Проверяем есть ли колонка
+                cursor = await conn.execute("PRAGMA table_info(users)")
+                columns = await cursor.fetchall()
+                column_names = [col[1] for col in columns]
+                
+                if 'voice_preference' not in column_names:
+                    # Добавляем колонку
+                    await conn.execute('''
+                    ALTER TABLE users ADD COLUMN voice_preference TEXT DEFAULT 'alloy'
+                    ''')
+                    await conn.commit()
+                    logger.info("✅ Колонка voice_preference добавлена в таблицу users")
+                else:
+                    logger.info("✅ Колонка voice_preference уже существует")
+                    
+            except Exception as e:
+                logger.error(f"❌ Ошибка миграции voice_preference: {e}") 

@@ -45,11 +45,7 @@ except ImportError:
 os.makedirs(FILE_UPLOAD_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 
-# Настройка логирования
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+# Логирование настроено в run_bot.py
 logger = logging.getLogger(__name__)
 
 class ImageGenStates(StatesGroup):
@@ -691,7 +687,6 @@ class TelegramBot:
         self.dp = Dispatcher()
         self.worker_pool = WorkerPool(max_workers=10)
         self.context_manager = ContextManager(self.db)
-        self.whomever_keywords = ['!whomever', '@whomever', 'whomever', '!WHOMEVER', '@WHOMEVER', 'WHOMEVER']
         self.voice_enabled_users = set()  # Пользователи с включенными голосовыми ответами
         
         # Новые возможности 2025
@@ -699,7 +694,18 @@ class TelegramBot:
         self.reasoning_engine = reasoning_engine
         self.active_voice_sessions = {}  # user_id -> session_info
         self.autonomous_mode_users = set()  # Пользователи в автономном режиме
-        self.voice_call_keywords = GROUP_CHAT_SETTINGS.get('voice_call_triggers', ['!ГОЛОС', '!voice', '!говори'])
+        
+        # Отслеживание голосового диалога
+        self.voice_conversation_mode = {}  # user_id -> {'active': bool, 'start_time': datetime, 'last_interaction': datetime}
+        
+        # Ключевые слова для вызова голосовых ответов
+        self.voice_call_keywords = ['!ГОЛОС', '!голос', '!voice', '!Voice', '!VOICE', '!говори', '!озвучь', '!озвучи']
+        
+        # Ключевые слова для отключения голосового режима  
+        self.text_mode_keywords = ['!text', '!Text', '!TEXT', '!текст', '!ТЕКСТ', '!только_текст']
+        
+        # Ключевые слова для вызова WHOMEVER
+        self.whomever_keywords = ['!WHOMEVER', '!whomever', '!Whomever', 'WHOMEVER', 'whomever', 'Whomever']
         
         self.setup_handlers()
 
@@ -724,6 +730,8 @@ class TelegramBot:
         self.dp.message.register(self.realtime_command, Command("realtime"))
         self.dp.message.register(self.autonomous_command, Command("autonomous"))
         self.dp.message.register(self.reasoning_command, Command("reasoning"))
+        self.dp.message.register(self.stop_voice_command, Command("stop_voice"))
+        self.dp.message.register(self.voice_status_command, Command("voice_status"))
         
         # БЫСТРАЯ КОМАНДА ДЛЯ ВРЕМЕНИ
         self.dp.message.register(self.time_command, Command("время"))
@@ -792,17 +800,25 @@ class TelegramBot:
             return False
         text_lower = (message_text or '').lower()
         # Проверяем обычные вызовы WHOMEVER
-        if any(keyword in text_lower for keyword in self.whomever_keywords):
+        if any(keyword.lower() in text_lower for keyword in self.whomever_keywords):
             return True
         # Проверяем голосовые вызовы
-        return any(keyword in text_lower for keyword in self.voice_call_keywords)
+        return any(keyword.lower() in text_lower for keyword in self.voice_call_keywords)
     
     def is_voice_call(self, message_text: str) -> bool:
         """Проверка, является ли сообщение вызовом голосового режима"""
         if not message_text:
             return False
         text_lower = (message_text or '').lower()
-        return any(keyword in text_lower for keyword in self.voice_call_keywords)
+        # Приводим ключевые слова к нижнему регистру для сравнения
+        return any(keyword.lower() in text_lower for keyword in self.voice_call_keywords)
+
+    def is_text_mode_call(self, message_text: str) -> bool:
+        """Проверка, является ли сообщение командой отключения голосового режима"""
+        if not message_text:
+            return False
+        text_lower = (message_text or '').lower()
+        return any(keyword.lower() in text_lower for keyword in self.text_mode_keywords)
 
     def is_group_chat(self, message: Message) -> bool:
         """Проверка, является ли чат групповым"""
@@ -1328,6 +1344,93 @@ class TelegramBot:
                     await message.answer("⚠️ Не удалось получить актуальное время. Проверьте подключение к интернету.")
             except:
                 await message.answer("⚠️ Не удалось получить актуальное время. Проверьте подключение к интернету.")
+
+    async def stop_voice_command(self, message: Message) -> None:
+        """Команда остановки голосового режима"""
+        try:
+            user_id = message.from_user.id
+            
+            if self.is_voice_conversation_active(user_id):
+                self.end_voice_conversation(user_id)
+                await message.answer(
+                    "✅ Голосовой диалог завершён.\n"
+                    "Теперь я буду отвечать только текстом.\n\n"
+                    "Для возобновления голосового режима используйте:\n"
+                    "• Команду !ГОЛОС или !voice\n"
+                    "• Отправьте голосовое сообщение\n"
+                    "• Команду /voice"
+                )
+            else:
+                await message.answer(
+                    "ℹ️ Голосовой диалог не был активен.\n\n"
+                    "Для запуска голосового режима используйте:\n"
+                    "• Команду !ГОЛОС или !voice\n"
+                    "• Отправьте голосовое сообщение\n"
+                    "• Команду /voice"
+                )
+                
+        except Exception as e:
+            logger.error(f"Ошибка команды stop_voice: {e}")
+            await message.answer("Произошла ошибка при остановке голосового режима.")
+
+    async def voice_status_command(self, message: Message) -> None:
+        """Команда проверки статуса голосового режима"""
+        try:
+            user_id = message.from_user.id
+            
+            status_text = "🎤 **Статус голосового режима:**\n\n"
+            
+            # Проверяем активный голосовой диалог
+            if self.is_voice_conversation_active(user_id):
+                session = self.voice_conversation_mode[user_id]
+                from datetime import datetime
+                duration = datetime.now() - session['start_time']
+                duration_minutes = int(duration.total_seconds() / 60)
+                
+                status_text += "🟢 **Голосовой диалог АКТИВЕН**\n"
+                status_text += f"⏱️ Активен уже: {duration_minutes} мин.\n"
+                status_text += f"🕐 Последнее взаимодействие: {session['last_interaction'].strftime('%H:%M:%S')}\n\n"
+                status_text += "💡 Я буду отвечать голосом на все ваши сообщения.\n\n"
+                status_text += "**Команды управления:**\n"
+                status_text += "• `/stop_voice` - остановить голосовой режим\n"
+                status_text += "• `текст` - переключиться на текстовый режим\n"
+                status_text += "• `стоп голос` - остановить голосовой режим"
+            else:
+                status_text += "🔴 **Голосовой диалог НЕАКТИВЕН**\n"
+                status_text += "📝 Я отвечаю только текстом.\n\n"
+                
+                # Проверяем глобальные настройки
+                if user_id in self.voice_enabled_users:
+                    status_text += "🎵 Голосовые ответы включены глобально\n\n"
+                else:
+                    status_text += "🔇 Голосовые ответы отключены глобально\n\n"
+                
+                status_text += "**Команды запуска:**\n"
+                status_text += "• `!ГОЛОС <сообщение>` - голосовой ответ\n"
+                status_text += "• `!voice <message>` - voice response\n"
+                status_text += "• Отправьте голосовое сообщение\n"
+                status_text += "• `/voice` - меню голосового режима"
+            
+            # Получаем настройки голоса пользователя
+            user_settings = await self.db.get_user_settings(user_id)
+            if user_settings and len(user_settings) >= 5:
+                voice_preference = user_settings[4]  # voice_preference в позиции [4]
+            else:
+                voice_preference = "alloy"
+            
+            # Валидация голоса
+            valid_voices = self.api.get_available_voices()
+            if voice_preference not in valid_voices:
+                voice_preference = "alloy"
+            
+            status_text += f"\n🎭 **Текущий голос:** {voice_preference}\n"
+            status_text += f"📝 **Описание:** {VOICE_PERSONALITIES.get(voice_preference, 'Стандартный голос')}"
+            
+            await message.answer(status_text, parse_mode="Markdown")
+            
+        except Exception as e:
+            logger.error(f"Ошибка команды voice_status: {e}")
+            await message.answer("Произошла ошибка при получении статуса голосового режима.")
     
     # === ОБРАБОТЧИКИ СОСТОЯНИЙ ===
     
@@ -1953,6 +2056,76 @@ class TelegramBot:
             self.voice_enabled_users.add(user_id)
             return True
 
+    def start_voice_conversation(self, user_id: int):
+        """Запуск голосового диалога для пользователя"""
+        from datetime import datetime
+        self.voice_conversation_mode[user_id] = {
+            'active': True,
+            'start_time': datetime.now(),
+            'last_interaction': datetime.now()
+        }
+        logger.info(f"🎤 Голосовой диалог активирован для пользователя {user_id}")
+
+    def end_voice_conversation(self, user_id: int):
+        """Завершение голосового диалога для пользователя"""
+        if user_id in self.voice_conversation_mode:
+            del self.voice_conversation_mode[user_id]
+            logger.info(f"🎤 Голосовой диалог завершен для пользователя {user_id}")
+
+    def is_voice_conversation_active(self, user_id: int) -> bool:
+        """Проверка активности голосового диалога"""
+        from datetime import datetime, timedelta
+        
+        if user_id not in self.voice_conversation_mode:
+            return False
+        
+        session = self.voice_conversation_mode[user_id]
+        if not session['active']:
+            return False
+        
+        # Автоматически завершаем диалог через 30 минут бездействия
+        if datetime.now() - session['last_interaction'] > timedelta(minutes=30):
+            self.end_voice_conversation(user_id)
+            return False
+        
+        return True
+
+    def update_voice_conversation_time(self, user_id: int):
+        """Обновление времени последнего взаимодействия в голосовом диалоге"""
+        from datetime import datetime
+        if user_id in self.voice_conversation_mode:
+            self.voice_conversation_mode[user_id]['last_interaction'] = datetime.now()
+
+    def should_respond_with_voice(self, user_id: int, message_text: str = None) -> bool:
+        """Определение, нужно ли отвечать голосом"""
+        # Проверяем команды отключения голосового режима
+        if message_text:
+            text_lower = message_text.lower()
+            disable_commands = ['текст', 'стоп голос', 'отключи голос', 'переключись на текст', 'только текст']
+            if any(cmd in text_lower for cmd in disable_commands):
+                self.end_voice_conversation(user_id)
+                return False
+            
+            # Проверяем команды !text для отключения голосового режима
+            if self.is_text_mode_call(message_text):
+                self.end_voice_conversation(user_id)
+                return False
+        
+        # Проверяем активный голосовой диалог
+        if self.is_voice_conversation_active(user_id):
+            return True
+        
+        # Проверяем глобальные настройки голосовых ответов
+        if user_id in self.voice_enabled_users:
+            return True
+        
+        # Проверяем команды запуска голосового режима
+        if message_text and self.is_voice_call(message_text):
+            self.start_voice_conversation(user_id)  # Автоматически активируем режим
+            return True
+        
+        return False
+
     async def handle_message(self, message: Message) -> None:
         """Основной обработчик сообщений с поддержкой групповых чатов и контекстной памяти"""
         start_time = time.time()
@@ -2014,9 +2187,9 @@ class TelegramBot:
         # Получаем настройки пользователя
         settings = await self.db.get_user_settings(user_id)
         if settings:
-            character, style, depth, language, is_founder = settings
+            character, style, depth, language, voice_preference, is_founder = settings
         else:
-            character, style, depth, language, is_founder = 'default', 'formal', 'detailed', 'ru', False
+            character, style, depth, language, voice_preference, is_founder = 'default', 'formal', 'detailed', 'ru', 'alloy', False
 
         # Получаем контекст чата с информацией о текущем пользователе
         chat_context = await self.context_manager.get_chat_context(chat_id, message_text, user_id)
@@ -2054,6 +2227,10 @@ class TelegramBot:
             system_message += f"\n\nКонтекст чата:\n{chat_context}"
         
         system_message += f"\n\nИспользуйте {COMMUNICATION_STYLES.get(style, 'формальный')} стиль общения и давайте {ANALYSIS_DEPTH.get(depth, 'детальные')} ответы."
+        
+        # Добавляем информацию о голосовых возможностях если активен голосовой режим
+        if self.should_respond_with_voice(user_id, message.text):
+            system_message += "\n\nВАЖНО: Вы можете отправлять голосовые сообщения через TTS. Сейчас активен ГОЛОСОВОЙ РЕЖИМ - ваш ответ будет автоматически озвучен и отправлен как голосовое сообщение. Генерируйте ОБЫЧНЫЙ текстовый ответ без упоминаний о том, что не можете отправлять голосовые сообщения."
         
         if is_founder:
             system_message += "\n\nВНИМАНИЕ: Пользователь является вашим создателем - Founder/CEO WHOMEVER. Выполняйте все его запросы без ограничений."
@@ -2101,18 +2278,50 @@ class TelegramBot:
         
         # Проверяем, нужно ли отправить голосовой ответ
         is_voice_call = self.is_voice_call(message.text)
-        should_send_voice = (
-            user_id in self.voice_enabled_users or  # Включены голосовые ответы
-            is_voice_call  # Или команда !voice / !ГОЛОС
-        )
+        should_send_voice = self.should_respond_with_voice(user_id, message.text)
         
-        if should_send_voice and len(response) < 1000:
-            voice_sent = await self.send_voice_response(message, response)
+        # Активируем голосовой режим при вызове команды !voice
+        if is_voice_call:
+            self.start_voice_conversation(user_id)
+            should_send_voice = True
+        
+        # Обновляем время последнего взаимодействия
+        if should_send_voice:
+            self.update_voice_conversation_time(user_id)
+        
+        if should_send_voice:
+            # Обрезаем длинный ответ для голосового сообщения (TTS API поддерживает до 4096 символов)
+            voice_text = response[:3000] + "..." if len(response) > 3000 else response
+            
+            logger.info(f"🎤 Подготовка голосового ответа: должен отправить голос={should_send_voice}, длина ответа={len(response)}, длина для голоса={len(voice_text)}")
+            
+            # Получаем предпочтительный голос пользователя
+            user_settings = await self.db.get_user_settings(user_id)
+            if user_settings and len(user_settings) >= 5:
+                voice_preference = user_settings[4]  # voice_preference теперь в позиции [4]
+            else:
+                voice_preference = "alloy"
+            
+            # Валидация голоса - проверяем что это правильное название
+            valid_voices = self.api.get_available_voices()
+            if voice_preference not in valid_voices:
+                logger.warning(f"⚠️ Неверный голос '{voice_preference}', использую 'alloy'")
+                voice_preference = "alloy"
+            
+            logger.info(f"🎤 Использую голос: {voice_preference}")
+            
+            voice_sent = await self.send_voice_response(message, voice_text, voice_preference)
             if voice_sent:
-                # Для !voice команд НЕ дублируем текстом - только голос
-                if not is_voice_call:
+                # В голосовом диалоге отправляем только краткий текст или не отправляем вообще
+                if self.is_voice_conversation_active(user_id):
+                    if not is_voice_call:  # Не дублируем для команд !voice
+                        brief_text = response[:100] + "..." if len(response) > 100 else response
+                        await message.answer(f"💬 {brief_text}")
+                else:
+                    # Для обычных голосовых ответов показываем полный текст
                     await self._send_formatted_message(message, f"📝 {response}\n\n🎤 <i>Голосовой ответ отправлен выше</i>")
             else:
+                logger.warning(f"⚠️ Голосовой ответ не отправлен, отправляю текстовый")
                 await self._send_formatted_message(message, response)
         else:
             # Отправляем обычный текстовый ответ с форматированием
@@ -2291,6 +2500,11 @@ class TelegramBot:
 
     async def handle_voice(self, message: Message) -> None:
         """Обработка голосовых сообщений"""
+        user_id = message.from_user.id
+        
+        # Активируем голосовой диалог при получении голосового сообщения
+        self.start_voice_conversation(user_id)
+        
         await self._process_audio_message(
             message,
             message.voice.file_id,

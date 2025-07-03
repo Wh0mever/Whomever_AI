@@ -19,14 +19,23 @@ from realtime_voice import RealtimeVoiceManager
 from reasoning_api import AgenticReasoningEngine
 
 # Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('logs/bot.log', encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+log_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+
+# Создаем файловый обработчик
+file_handler = logging.FileHandler('logs/bot.log', encoding='utf-8', mode='a')
+file_handler.setFormatter(log_formatter)
+file_handler.setLevel(logging.INFO)
+
+# Создаем консольный обработчик
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(log_formatter)
+console_handler.setLevel(logging.INFO)
+
+# Настраиваем root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+root_logger.addHandler(file_handler)
+root_logger.addHandler(console_handler)
 
 logger = logging.getLogger(__name__)
 
@@ -42,8 +51,11 @@ async def main():
         
         # Инициализация компонентов
         logger.info("📊 Инициализация базы данных...")
-        db = Database()
-        await db.init_db()
+        database = Database()
+        await database.init_db()
+        
+        # Выполняем миграции
+        await database.migrate_add_voice_preference()
         
         logger.info("🤖 Инициализация OpenAI API...")
         api = OpenAIAPI()
@@ -60,15 +72,17 @@ async def main():
         
         # Создание основного экземпляра бота
         logger.info("🤖 Создание экземпляра TelegramBot...")
+        # Создаем основной экземпляр бота
         bot = TelegramBot()
         
+        # Передаем зависимости
+        bot.db = database
+        bot.api = api
+        
         # Интеграция новых компонентов (они уже инициализированы в bot.py)
-        # bot.voice_manager и bot.reasoning_engine уже созданы в __init__
         logger.info("🔧 Интеграция новых компонентов...")
         
-        # Обновляем voice_manager с корректным API ключом
-        bot.voice_manager = voice_manager
-        bot.reasoning_engine = reasoning_engine
+        # Обновляем зависимости если нужно (bot уже инициализирован с правильными компонентами)
         
         logger.info("✅ Все компоненты инициализированы успешно!")
         logger.info("🎯 Новые возможности 2025:")

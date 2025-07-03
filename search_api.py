@@ -8,7 +8,7 @@ import re
 from bs4 import BeautifulSoup
 from config import SEARCH_SETTINGS
 
-logging.basicConfig(level=logging.INFO)
+# Логирование настроено в run_bot.py
 logger = logging.getLogger(__name__)
 
 class SearchAPI:
@@ -57,7 +57,7 @@ class SearchAPI:
             return []
 
     async def _duckduckgo_instant(self, query: str) -> List[Dict]:
-        """DuckDuckGo Instant Answer API"""
+        """DuckDuckGo Instant Answer API с улучшенной обработкой ошибок"""
         try:
             url = f"https://api.duckduckgo.com/"
             params = {
@@ -72,7 +72,18 @@ class SearchAPI:
             async with aiohttp.ClientSession(timeout=timeout, headers=self.headers) as session:
                 async with session.get(url, params=params) as response:
                     if response.status == 200:
-                        data = await response.json()
+                        # Проверяем Content-Type перед парсингом JSON
+                        content_type = response.headers.get('content-type', '').lower()
+                        if 'application/json' not in content_type:
+                            logger.warning(f"DuckDuckGo вернул неожиданный Content-Type: {content_type}")
+                            return []
+                        
+                        try:
+                            data = await response.json()
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Ошибка парсинга JSON от DuckDuckGo: {e}")
+                            return []
+                        
                         results = []
                         
                         # Добавляем абстракт если есть
@@ -95,9 +106,13 @@ class SearchAPI:
                                 })
                         
                         return results[:self.max_results]
+                    else:
+                        logger.warning(f"DuckDuckGo API вернул код {response.status}")
                         
+        except aiohttp.ClientError as e:
+            logger.error(f"Ошибка сети DuckDuckGo API: {e}")
         except Exception as e:
-            logger.error(f"Ошибка DuckDuckGo Instant API: {str(e)}")
+            logger.error(f"Неожиданная ошибка DuckDuckGo Instant API: {e}")
         
         return []
 

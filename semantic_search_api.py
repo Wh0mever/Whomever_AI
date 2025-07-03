@@ -1,17 +1,26 @@
 import aiohttp
 import asyncio
-import numpy as np
-from typing import List, Dict, Any, Optional, Union
 import json
 import logging
 from datetime import datetime
 import time
-from sklearn.metrics.pairwise import cosine_similarity
 from config import OPENAI_API_KEY
 import re
 import hashlib
+from typing import List, Dict, Any, Optional, Union
 
-logger = logging.getLogger(__name__)
+try:
+    import numpy as np
+    from sklearn.metrics.pairwise import cosine_similarity
+    SKLEARN_AVAILABLE = True
+    logger = logging.getLogger(__name__)
+    logger.info("✅ NumPy и scikit-learn загружены успешно")
+except ImportError as e:
+    SKLEARN_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.error(f"❌ Ошибка импорта NumPy/scikit-learn: {e}")
+    # Используем альтернативную реализацию
+    import math
 
 class SemanticSearchAPI:
     """
@@ -57,7 +66,31 @@ class SemanticSearchAPI:
             }
         }
         
-        logger.info("🧠 Semantic Search API инициализирован с text-embedding-3-large")
+        if SKLEARN_AVAILABLE:
+            logger.info("🧠 Semantic Search API инициализирован с text-embedding-3-large (полный режим)")
+        else:
+            logger.warning("🧠 Semantic Search API инициализирован с text-embedding-3-large (базовый режим без scikit-learn)")
+
+    def _cosine_similarity_manual(self, vec1: List[float], vec2: List[float]) -> float:
+        """Альтернативная реализация cosine similarity без scikit-learn"""
+        try:
+            if not vec1 or not vec2 or len(vec1) != len(vec2):
+                return 0.0
+            
+            # Скалярное произведение
+            dot_product = sum(a * b for a, b in zip(vec1, vec2))
+            
+            # Нормы векторов
+            norm1 = math.sqrt(sum(a * a for a in vec1))
+            norm2 = math.sqrt(sum(a * a for a in vec2))
+            
+            if norm1 == 0.0 or norm2 == 0.0:
+                return 0.0
+            
+            return dot_product / (norm1 * norm2)
+        except Exception as e:
+            logger.error(f"Ошибка вычисления cosine similarity: {e}")
+            return 0.0
 
     async def get_embedding(self, text: str, use_cache: bool = True) -> Optional[List[float]]:
         """Получение embedding для текста с кэшированием"""
@@ -285,10 +318,13 @@ class SemanticSearchAPI:
             
             for i, (result, embedding) in enumerate(zip(search_results, result_embeddings)):
                 if isinstance(embedding, list) and len(embedding) > 0:
-                    similarity = cosine_similarity(
-                        [query_embedding], 
-                        [embedding]
-                    )[0][0]
+                    if SKLEARN_AVAILABLE:
+                        similarity = cosine_similarity(
+                            [query_embedding], 
+                            [embedding]
+                        )[0][0]
+                    else:
+                        similarity = self._cosine_similarity_manual(query_embedding, embedding)
                     
                     source_weight = result.get('source_weight', 1.0)
                     semantic_score = similarity * source_weight

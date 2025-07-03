@@ -20,17 +20,27 @@ from config import OPENAI_API_KEY
 import sounddevice as sd
 import numpy as np
 
-# Временная совместимость с Python 3.13 (audioop удален)
+logger = logging.getLogger(__name__)
+
+# Совместимость с Python 3.13 - улучшенная обработка аудио
 try:
     from pydub import AudioSegment
     AUDIO_PROCESSING_AVAILABLE = True
-except ImportError:
+    logger.info("✅ pydub загружен успешно")
+except ImportError as e:
     AUDIO_PROCESSING_AVAILABLE = False
-    print("⚠️ Аудио обработка pydub недоступна в Python 3.13. Используется базовый функционал.")
+    logger.warning(f"⚠️ pydub недоступен ({e}). Используется базовая аудио обработка без конвертации.")
+    
+# Альтернативные импорты для аудио обработки
+try:
+    import wave
+    import struct
+    WAVE_PROCESSING_AVAILABLE = True
+except ImportError:
+    WAVE_PROCESSING_AVAILABLE = False
+    logger.error("❌ Модуль wave недоступен - аудио функционал ограничен")
 
 from aiogram.types import Message, FSInputFile
-
-logger = logging.getLogger(__name__)
 
 class RealtimeVoiceSession:
     """Класс для управления голосовой сессией в реальном времени"""
@@ -533,13 +543,55 @@ class AudioUtils:
                 
                 return audio.raw_data
             else:
-                # Базовое решение без pydub
-                logger.warning("Конвертация OGG->PCM16 недоступна без pydub")
-                return ogg_data  # Возвращаем как есть
+                # Альтернативный способ без pydub - используем внешний ffmpeg
+                return AudioUtils._convert_with_ffmpeg(ogg_data, 'ogg', target_sample_rate)
             
         except Exception as e:
             logger.error(f"Ошибка конвертации OGG в PCM16: {e}")
             return b""
+
+    @staticmethod
+    def _convert_with_ffmpeg(audio_data: bytes, input_format: str, sample_rate: int = 24000) -> bytes:
+        """Конвертация аудио через внешний ffmpeg (fallback для Python 3.13)"""
+        try:
+            import subprocess
+            import tempfile
+            
+            # Создаем временные файлы
+            with tempfile.NamedTemporaryFile(suffix=f'.{input_format}', delete=False) as input_file:
+                input_file.write(audio_data)
+                input_path = input_file.name
+            
+            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as output_file:
+                output_path = output_file.name
+            
+            # Выполняем конвертацию через ffmpeg
+            cmd = [
+                'ffmpeg', '-y',  # перезаписать выходной файл
+                '-i', input_path,  # входной файл
+                '-ar', str(sample_rate),  # частота дискретизации
+                '-ac', '1',  # моно
+                '-sample_fmt', 's16',  # 16-bit PCM
+                '-f', 'wav',  # формат WAV
+                output_path
+            ]
+            
+            subprocess.run(cmd, check=True, capture_output=True)
+            
+            # Читаем результат
+            with open(output_path, 'rb') as f:
+                result_data = f.read()
+            
+            # Удаляем временные файлы
+            os.unlink(input_path)
+            os.unlink(output_path)
+            
+            return result_data
+            
+        except Exception as e:
+            logger.warning(f"ffmpeg конвертация недоступна: {e}")
+            logger.info("💡 Для полной поддержки аудио установите ffmpeg или используйте Python < 3.13")
+            return audio_data  # Возвращаем как есть
     
     @staticmethod
     def pcm16_to_ogg(pcm_data: bytes, sample_rate: int = 24000) -> bytes:
@@ -559,13 +611,38 @@ class AudioUtils:
                 audio.export(ogg_buffer, format="ogg", codec="libopus")
                 return ogg_buffer.getvalue()
             else:
-                # Базовое решение без pydub
-                logger.warning("Конвертация PCM16->OGG недоступна без pydub")
-                return pcm_data  # Возвращаем как есть
+                # Альтернативный способ - создаем WAV файл через wave модуль
+                return AudioUtils._create_wav_from_pcm(pcm_data, sample_rate)
             
         except Exception as e:
             logger.error(f"Ошибка конвертации PCM16 в OGG: {e}")
             return b""
+
+    @staticmethod
+    def _create_wav_from_pcm(pcm_data: bytes, sample_rate: int = 24000) -> bytes:
+        """Создание WAV файла из PCM данных (fallback для Python 3.13)"""
+        try:
+            if WAVE_PROCESSING_AVAILABLE:
+                import wave
+                import struct
+                
+                # Создаем WAV файл в памяти
+                wav_buffer = io.BytesIO()
+                
+                with wave.open(wav_buffer, 'wb') as wav_file:
+                    wav_file.setnchannels(1)  # Моно
+                    wav_file.setsampwidth(2)  # 16-bit
+                    wav_file.setframerate(sample_rate)
+                    wav_file.writeframes(pcm_data)
+                
+                return wav_buffer.getvalue()
+            else:
+                logger.warning("Модуль wave недоступен - возвращаем исходные данные")
+                return pcm_data
+                
+        except Exception as e:
+            logger.error(f"Ошибка создания WAV из PCM: {e}")
+            return pcm_data
     
     @staticmethod
     async def save_audio_to_file(audio_data: bytes, file_format: str = "ogg") -> str:
