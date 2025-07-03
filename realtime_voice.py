@@ -19,7 +19,15 @@ import aiohttp
 from config import OPENAI_API_KEY
 import sounddevice as sd
 import numpy as np
-from pydub import AudioSegment
+
+# Временная совместимость с Python 3.13 (audioop удален)
+try:
+    from pydub import AudioSegment
+    AUDIO_PROCESSING_AVAILABLE = True
+except ImportError:
+    AUDIO_PROCESSING_AVAILABLE = False
+    print("⚠️ Аудио обработка pydub недоступна в Python 3.13. Используется базовый функционал.")
+
 from aiogram.types import Message, FSInputFile
 
 logger = logging.getLogger(__name__)
@@ -514,15 +522,20 @@ class AudioUtils:
     def ogg_to_pcm16(ogg_data: bytes, target_sample_rate: int = 24000) -> bytes:
         """Конвертация OGG в PCM16 формат для Realtime API"""
         try:
-            # Используем pydub для конвертации
-            audio = AudioSegment.from_ogg(io.BytesIO(ogg_data))
-            
-            # Конвертируем в нужный формат
-            audio = audio.set_frame_rate(target_sample_rate)
-            audio = audio.set_channels(1)  # Mono
-            audio = audio.set_sample_width(2)  # 16-bit
-            
-            return audio.raw_data
+            if AUDIO_PROCESSING_AVAILABLE:
+                # Используем pydub для конвертации
+                audio = AudioSegment.from_ogg(io.BytesIO(ogg_data))
+                
+                # Конвертируем в нужный формат
+                audio = audio.set_frame_rate(target_sample_rate)
+                audio = audio.set_channels(1)  # Mono
+                audio = audio.set_sample_width(2)  # 16-bit
+                
+                return audio.raw_data
+            else:
+                # Базовое решение без pydub
+                logger.warning("Конвертация OGG->PCM16 недоступна без pydub")
+                return ogg_data  # Возвращаем как есть
             
         except Exception as e:
             logger.error(f"Ошибка конвертации OGG в PCM16: {e}")
@@ -532,18 +545,23 @@ class AudioUtils:
     def pcm16_to_ogg(pcm_data: bytes, sample_rate: int = 24000) -> bytes:
         """Конвертация PCM16 в OGG для отправки в Telegram"""
         try:
-            # Создаем AudioSegment из PCM данных
-            audio = AudioSegment(
-                data=pcm_data,
-                sample_width=2,  # 16-bit
-                frame_rate=sample_rate,
-                channels=1  # Mono
-            )
-            
-            # Экспортируем в OGG
-            ogg_buffer = io.BytesIO()
-            audio.export(ogg_buffer, format="ogg", codec="libopus")
-            return ogg_buffer.getvalue()
+            if AUDIO_PROCESSING_AVAILABLE:
+                # Создаем AudioSegment из PCM данных
+                audio = AudioSegment(
+                    data=pcm_data,
+                    sample_width=2,  # 16-bit
+                    frame_rate=sample_rate,
+                    channels=1  # Mono
+                )
+                
+                # Экспортируем в OGG
+                ogg_buffer = io.BytesIO()
+                audio.export(ogg_buffer, format="ogg", codec="libopus")
+                return ogg_buffer.getvalue()
+            else:
+                # Базовое решение без pydub
+                logger.warning("Конвертация PCM16->OGG недоступна без pydub")
+                return pcm_data  # Возвращаем как есть
             
         except Exception as e:
             logger.error(f"Ошибка конвертации PCM16 в OGG: {e}")

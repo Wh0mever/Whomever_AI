@@ -1,36 +1,72 @@
-import asyncio
-import logging
-import backoff
-from typing import List, Dict, Any, Optional, Union
 import aiohttp
+import asyncio
 import json
+import logging
+import base64
+import io
+from typing import List, Dict, Optional, Union, Any
+from pathlib import Path
+import aiosqlite
+from datetime import datetime, timedelta
 import os
-from config import OPENAI_API_KEY
+import re
 import mimetypes
 import aiofiles
-import requests
-from bs4 import BeautifulSoup
 import subprocess
 import tempfile
-import base64
-from io import BytesIO
-from PIL import Image
 import websockets
 import uuid
+from config import OPENAI_API_KEY, OPENAI_MODEL, OPENAI_MAX_TOKENS, OPENAI_TEMPERATURE
+
+# НОВЫЙ ИМПОРТ для семантического поиска!
+try:
+    from semantic_search_api import semantic_search_api
+    SEMANTIC_SEARCH_AVAILABLE = True
+    logger = logging.getLogger(__name__)
+    logger.info("🧠 Семантический поиск с embeddings подключен!")
+except ImportError:
+    SEMANTIC_SEARCH_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.warning("⚠️ Семантический поиск недоступен - используется базовый поиск")
+
+# Поисковый API
+try:
+    from search_api import SearchAPI
+    SEARCH_API_AVAILABLE = True
+except ImportError:
+    SEARCH_API_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.warning("⚠️ SearchAPI недоступен")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 class OpenAIAPI:
-    def __init__(self, max_workers: int = 50):
+    def __init__(self, max_workers: int = 10):
         self.api_key = OPENAI_API_KEY
+        self.model = OPENAI_MODEL
+        self.max_tokens = OPENAI_MAX_TOKENS
+        self.temperature = OPENAI_TEMPERATURE
         self.base_url = "https://api.openai.com/v1"
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json"
         }
         self.max_workers = max_workers
-        self.semaphore = asyncio.Semaphore(max_workers)
+        self.worker_semaphore = asyncio.Semaphore(max_workers)
+        
+        # Инициализация поисковых API с проверкой доступности
+        if SEARCH_API_AVAILABLE:
+            self.search_api = SearchAPI()
+        else:
+            self.search_api = None
+        
+        # НОВАЯ ИНТЕГРАЦИЯ: Семантический поиск
+        self.semantic_search_enabled = SEMANTIC_SEARCH_AVAILABLE
+        if self.semantic_search_enabled:
+            logger.info("🔍 OpenAI API настроен с семантическим поиском!")
+        
+        # Поддерживаемые типы файлов
         self.supported_file_types = {
             'text/plain': self._process_text_file,
             'application/pdf': self._process_pdf_file,
@@ -44,6 +80,8 @@ class OpenAIAPI:
             'video/mp4': self._process_video_file
         }
         
+        logger.info(f"🤖 OpenAI API инициализирован: {self.model} (макс. токенов: {self.max_tokens})")
+
     def _validate_messages(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
         """Проверяет и очищает сообщения перед отправкой в API"""
         validated_messages = []
@@ -60,11 +98,9 @@ class OpenAIAPI:
             })
         return validated_messages or [{'role': 'user', 'content': 'Привет'}]
 
-    @backoff.on_exception(backoff.expo, 
-                         (aiohttp.ClientError, asyncio.TimeoutError), 
-                         max_tries=3)
     async def _make_request(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]] = None) -> str:
-        async with self.semaphore:
+        """Выполнение запроса с простой логикой повторов"""
+        async with self.worker_semaphore:
             validated_messages = self._validate_messages(messages)
             
             request_data = {
@@ -81,24 +117,40 @@ class OpenAIAPI:
                 request_data["tools"] = tools
                 request_data["tool_choice"] = "auto"
             
-            timeout = aiohttp.ClientTimeout(total=30)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(
-                    f"{self.base_url}/chat/completions",
-                    headers=self.headers,
-                    json=request_data
-                ) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        content = data['choices'][0]['message']['content']
-                        return content if content is not None else "Извините, не удалось сгенерировать ответ."
+            # Простая логика повторов (замена @backoff)
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    timeout = aiohttp.ClientTimeout(total=30)
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.post(
+                            f"{self.base_url}/chat/completions",
+                            headers=self.headers,
+                            json=request_data
+                        ) as response:
+                            if response.status == 200:
+                                data = await response.json()
+                                content = data['choices'][0]['message']['content']
+                                return content if content is not None else "Извините, не удалось сгенерировать ответ."
+                            else:
+                                error_text = await response.text()
+                                logger.error(f"Ошибка API: {response.status} - {error_text}")
+                                if attempt == max_retries - 1:  # Последняя попытка
+                                    raise aiohttp.ClientError(f"Ошибка API: {response.status}")
+                                
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    if attempt == max_retries - 1:  # Последняя попытка
+                        logger.error(f"Максимальное количество попыток исчерпано: {e}")
+                        raise
                     else:
-                        error_text = await response.text()
-                        logger.error(f"Ошибка API: {response.status} - {error_text}")
-                        raise aiohttp.ClientError(f"Ошибка API: {response.status}")
+                        wait_time = 2 ** attempt  # Экспоненциальная задержка
+                        logger.warning(f"Попытка {attempt + 1} неудачна, ждем {wait_time}с перед повтором...")
+                        await asyncio.sleep(wait_time)
 
     def _analyze_if_search_needed(self, messages: List[Dict[str, str]]) -> bool:
-        """Анализ, нужен ли автоматический поиск в интернете"""
+        """
+        УЛУЧШЕННЫЙ анализ необходимости поиска с учетом семантики
+        """
         try:
             if not messages:
                 return False
@@ -113,31 +165,64 @@ class OpenAIAPI:
             if not user_message:
                 return False
             
-            # Ключевые слова, указывающие на необходимость поиска актуальной информации
+            # СПЕЦИАЛЬНАЯ ПРОВЕРКА для времени - ВСЕГДА ищем!
+            time_keywords = [
+                "время", "time", "сейчас", "часов", "минут",
+                "мск", "москв", "moscow", "utc", "gmt",
+                "который час", "сколько времени", "какое время"
+            ]
+            
+            # Если это запрос о времени - ОБЯЗАТЕЛЬНО ищем
+            if any(keyword in user_message for keyword in time_keywords):
+                logger.info(f"🕐 ЗАПРОС О ВРЕМЕНИ ОБНАРУЖЕН: '{user_message[:50]}...'")
+                return True
+            
+            # РАСШИРЕННЫЕ индикаторы для поиска актуальной информации
             search_indicators = [
+                # Временные маркеры
                 "сейчас", "сегодня", "вчера", "завтра", "актуально", "последние",
                 "новости", "текущий", "свежий", "недавно", "этот год", "2025",
-                "что происходит", "что случилось", "цена", "курс", "стоимость",
+                "что происходит", "что случилось", "latest", "current", "recent",
+                
+                # Финансовые и рыночные запросы  
+                "цена", "курс", "стоимость", "биржа", "акции", "криптовалют",
+                "bitcoin", "ethereum", "доллар", "евро", "рубль", "инфляция",
+                
+                # Поисковые команды
+                "найди информацию", "поищи", "узнай", "проверь", "какая ситуация",
+                "что нового", "обновления", "изменения",
+                
+                # Специфичные темы
                 "погода", "время", "расписание", "когда", "где", "как добраться",
-                "найди информацию", "поищи", "узнай", "проверь", "какая ситуация"
+                "работает ли", "доступно ли", "открыто ли"
             ]
             
             # Темы, требующие актуальной информации
             search_topics = [
-                "коронавирус", "covid", "политика", "экономика", "биржа", "акции",
-                "криптовалют", "bitcoin", "эфир", "ethereum", "курс доллара", "евро",
-                "выборы", "война", "санкции", "инфляция", "процентная ставка"
+                "covid", "коронавирус", "политика", "экономика", "выборы", 
+                "война", "санкции", "процентная ставка", "нефть", "газ",
+                "технологии", "openai", "chatgpt", "ai", "искусственный интеллект"
             ]
             
             # Проверяем индикаторы поиска
             has_search_indicator = any(indicator in user_message for indicator in search_indicators)
             has_search_topic = any(topic in user_message for topic in search_topics)
             
-            # Вопросительные слова + актуальность
-            question_words = ["что", "где", "когда", "как", "почему", "сколько", "какой", "какая", "какие"]
+            # Вопросительные слова + потенциальная актуальность
+            question_words = ["что", "где", "когда", "как", "почему", "сколько", "какой", "какая", "какие", "кто"]
             has_question = any(word in user_message for word in question_words)
             
-            return has_search_indicator or has_search_topic or (has_question and len(user_message) > 10)
+            # НОВАЯ ЛОГИКА: более агрессивный поиск для лучшего UX
+            needs_search = (
+                has_search_indicator or 
+                has_search_topic or 
+                (has_question and len(user_message.split()) > 3)  # Сложные вопросы
+            )
+            
+            if needs_search:
+                logger.info(f"🔍 Определена необходимость поиска для: '{user_message[:50]}...'")
+            
+            return needs_search
             
         except Exception as e:
             logger.error(f"Ошибка анализа необходимости поиска: {e}")
@@ -159,7 +244,7 @@ class OpenAIAPI:
                         break
                 
                 # Создаем поисковый запрос на основе сообщения пользователя
-                search_query = self._extract_search_query(user_message)
+                search_query = self._extract_search_query(original_messages)
                 
                 if search_query:
                     # Выполняем поиск
@@ -174,7 +259,7 @@ class OpenAIAPI:
                         enhanced_messages = original_messages.copy()
                         enhanced_messages.append({
                             "role": "system",
-                            "content": f"Актуальная информация из интернета:\n{search_context}\n\nИспользуй эту информацию для ответа на вопрос пользователя."
+                            "content": f"🔍 АКТУАЛЬНАЯ ИНФОРМАЦИЯ ИЗ ИНТЕРНЕТА:\n{search_context}\n\nИспользуй эту информацию для точного ответа."
                         })
                         
                         # Генерируем финальный ответ с учетом найденной информации
@@ -187,24 +272,32 @@ class OpenAIAPI:
             logger.error(f"Ошибка обработки поискового ответа: {e}")
             return response
 
-    def _extract_search_query(self, user_message: str) -> str:
-        """Извлечение поискового запроса из сообщения пользователя"""
+    def _extract_search_query(self, messages: List[Dict]) -> str:
+        """Извлечение поискового запроса из сообщений пользователя"""
         try:
-            # Убираем лишние слова и оставляем ключевые
-            stop_words = ["пожалуйста", "можешь", "можете", "скажи", "расскажи", "объясни", "покажи"]
-            words = user_message.lower().split()
+            # Берем последнее сообщение пользователя
+            user_message = ""
+            for msg in reversed(messages):
+                if msg.get("role") == "user":
+                    user_message = msg.get("content", "")
+                    break
             
-            # Фильтруем стоп-слова
-            filtered_words = [word for word in words if word not in stop_words and len(word) > 2]
+            if not user_message:
+                return ""
+            
+            # Очищаем запрос для поиска
+            query = re.sub(r'[!@#$%^&*()_+=\[\]{}|;\':",./<>?`~]', ' ', user_message)
+            query = re.sub(r'\s+', ' ', query).strip()
             
             # Ограничиваем длину запроса
-            search_query = " ".join(filtered_words[:8])  # Максимум 8 слов
+            if len(query) > 100:
+                query = query[:100]
             
-            return search_query
+            return query
             
         except Exception as e:
             logger.error(f"Ошибка извлечения поискового запроса: {e}")
-            return user_message[:100]  # Fallback
+            return ""
 
     def _format_search_results(self, search_results: List[Dict]) -> str:
         """Форматирование результатов поиска для контекста ИИ"""
@@ -230,46 +323,181 @@ class OpenAIAPI:
             logger.error(f"Ошибка форматирования результатов поиска: {e}")
             return "Результаты поиска недоступны"
 
-    async def generate_response(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]] = None) -> str:
-        try:
-            # Определяем, нужен ли поиск
-            needs_search = self._analyze_if_search_needed(messages)
-            
-            if needs_search:
-                # Добавляем tool для автоматического поиска
-                search_tool = {
-                    "type": "function",
-                    "function": {
-                        "name": "search_internet",
-                        "description": "Поиск актуальной информации в интернете",
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "query": {
-                                    "type": "string",
-                                    "description": "Поисковый запрос для получения актуальной информации"
-                                }
-                            },
-                            "required": ["query"]
-                        }
-                    }
-                }
+    async def generate_response(self, messages: List[Dict[str, str]], 
+                              use_search: bool = None, search_query: str = None) -> str:
+        """
+        Генерация ответа с автоматическим семантическим поиском
+        
+        НОВЫЕ ВОЗМОЖНОСТИ:
+        - Автоматическое определение нужности поиска
+        - Семантический поиск с text-embedding-3-large
+        - Ранжирование результатов по релевантности
+        """
+        async with self.worker_semaphore:
+            try:
+                # Автоматическое определение необходимости поиска
+                if use_search is None:
+                    use_search = self._analyze_if_search_needed(messages)
                 
-                if tools:
-                    tools.append(search_tool)
-                else:
-                    tools = [search_tool]
+                # НОВАЯ ЛОГИКА: Семантический поиск вместо обычного
+                if use_search:
+                    search_results = await self._perform_smart_search(messages, search_query)
+                    if search_results:
+                        # Добавляем результаты поиска в контекст
+                        search_context = self._format_search_context(search_results)
+                        messages.append({
+                            "role": "system", 
+                            "content": f"🔍 АКТУАЛЬНАЯ ИНФОРМАЦИЯ ИЗ ИНТЕРНЕТА:\n{search_context}\n\nИспользуй эту информацию для точного ответа."
+                        })
+                
+                response = await self._make_request(messages)
+                return response
+                
+            except Exception as e:
+                logger.error(f"Ошибка генерации ответа: {e}")
+                return "Извините, произошла ошибка при генерации ответа."
+
+    async def _perform_smart_search(self, messages: List[Dict], search_query: str = None) -> List[Dict]:
+        """
+        Умный поиск: семантический если доступен, иначе обычный
+        """
+        try:
+            # Извлекаем поисковый запрос из сообщений
+            if not search_query:
+                search_query = self._extract_search_query(messages)
             
-            response = await self._make_request(messages, tools)
+            if not search_query:
+                return []
             
-            # Если бот решил использовать поиск, выполняем его
-            if needs_search and "search_internet" in str(response):
-                return await self._handle_search_response(response, messages)
+            logger.info(f"🔍 Выполняю умный поиск: '{search_query}'")
             
-            return response
+            # СПЕЦИАЛЬНАЯ ОБРАБОТКА ЗАПРОСОВ О ВРЕМЕНИ
+            if self._is_time_query(search_query):
+                return await self._get_current_time_info()
+            
+            # ПРИОРИТЕТ: Семантический поиск с embeddings
+            if self.semantic_search_enabled:
+                try:
+                    semantic_results = await semantic_search_api.semantic_search(
+                        query=search_query,
+                        max_results=6,
+                        include_news=True
+                    )
+                    
+                    if semantic_results:
+                        logger.info(f"✅ Семантический поиск: найдено {len(semantic_results)} релевантных результатов")
+                        return semantic_results
+                    else:
+                        logger.warning("⚠️ Семантический поиск не дал результатов, переходим к обычному")
+                        
+                except Exception as e:
+                    logger.error(f"Ошибка семантического поиска: {e}")
+            
+            # FALLBACK: Обычный поиск DuckDuckGo
+            try:
+                if not self.search_api:
+                    logger.warning("⚠️ SearchAPI недоступен - поиск невозможен")
+                    return []
+                    
+                fallback_results = await self.search_api.search(
+                    query=search_query,
+                    engine='duckduckgo'
+                )
+                
+                if fallback_results:
+                    logger.info(f"✅ Обычный поиск: найдено {len(fallback_results)} результатов")
+                    # Добавляем базовую релевантность
+                    for i, result in enumerate(fallback_results):
+                        result['semantic_score'] = 1.0 - (i * 0.1)  # Убывающая релевантность
+                        result['cosine_similarity'] = 0.8 - (i * 0.1)
+                        result['search_method'] = 'fallback_duckduckgo'
+                    return fallback_results
+                    
+            except Exception as e:
+                logger.error(f"Ошибка обычного поиска: {e}")
+            
+            return []
+            
         except Exception as e:
-            logger.error(f"Ошибка при генерации ответа: {str(e)}")
-            return "Произошла ошибка при обработке вашего запроса."
+            logger.error(f"Ошибка умного поиска: {e}")
+            return []
+
+    def _is_time_query(self, query: str) -> bool:
+        """Проверка, является ли запрос вопросом о времени"""
+        time_keywords = [
+            "время", "time", "сейчас", "часов", "минут",
+            "мск", "москв", "moscow", "utc", "gmt",
+            "который час", "сколько времени", "какое время"
+        ]
+        return any(keyword in query.lower() for keyword in time_keywords)
+
+    async def _get_current_time_info(self) -> List[Dict]:
+        """Получение актуального времени без поиска в интернете"""
+        try:
+            from datetime import datetime
+            import pytz
+            
+            # Получаем время в разных часовых поясах
+            moscow_tz = pytz.timezone('Europe/Moscow')
+            utc_now = datetime.utcnow()
+            moscow_time = utc_now.replace(tzinfo=pytz.UTC).astimezone(moscow_tz)
+            
+            # Форматируем как результат поиска
+            result = {
+                'title': 'Текущее время в Москве',
+                'description': f"Время в Москве (МСК): {moscow_time.strftime('%H:%M:%S')}, {moscow_time.strftime('%d.%m.%Y')} ({moscow_time.strftime('%A')}). UTC: {utc_now.strftime('%H:%M:%S')}",
+                'url': 'https://time.is/Moscow',
+                'source': 'Системное время',
+                'semantic_score': 1.0,
+                'cosine_similarity': 1.0,
+                'search_method': 'direct_time_query'
+            }
+            
+            logger.info("✅ Получено системное время для Москвы")
+            return [result]
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения системного времени: {e}")
+            return []
+
+    def _format_search_context(self, search_results: List[Dict]) -> str:
+        """
+        Форматирование результатов поиска для контекста
+        С УЛУЧШЕННЫМ отображением семантической релевантности
+        """
+        try:
+            if not search_results:
+                return "Информация не найдена."
+            
+            context_parts = []
+            
+            for i, result in enumerate(search_results[:5], 1):
+                title = result.get('title', 'Без названия')
+                description = result.get('description', 'Описание недоступно')
+                url = result.get('url', '')
+                source = result.get('source', 'Неизвестный источник')
+                
+                # НОВОЕ: Показываем семантическую релевантность
+                semantic_score = result.get('semantic_score', 0)
+                cosine_similarity = result.get('cosine_similarity', 0)
+                
+                relevance_indicator = "🎯" if semantic_score > 0.8 else "📍" if semantic_score > 0.6 else "📌"
+                
+                context_part = f"{relevance_indicator} **Результат {i}** (релевантность: {semantic_score:.2f})\n"
+                context_part += f"📰 **{title}**\n"
+                context_part += f"📝 {description}\n"
+                context_part += f"🔗 Источник: {source}\n"
+                
+                if url:
+                    context_part += f"🌐 URL: {url}\n"
+                
+                context_parts.append(context_part)
+            
+            return "\n" + "="*50 + "\n".join(context_parts) + "="*50
+            
+        except Exception as e:
+            logger.error(f"Ошибка форматирования поискового контекста: {e}")
+            return "Ошибка обработки результатов поиска."
 
     async def process_file(self, file_path: str, prompt_template: str) -> List[str]:
         """Обработка файла с использованием GPT-4o"""
@@ -513,25 +741,28 @@ class OpenAIAPI:
         """Транскрибация аудио через Whisper API"""
         try:
             with open(file_path, 'rb') as audio:
-                response = requests.post(
-                    f"{self.base_url}/audio/transcriptions",
-                    headers={"Authorization": f"Bearer {self.api_key}"},
-                    files={"file": audio},
-                    data={
-                        "model": "whisper-1",
-                        "language": language,
-                        "response_format": "text"
-                    }
-                )
-                
-                if response.status_code == 200:
-                    return response.text
-                else:
-                    logger.error(f"Ошибка Whisper API: {response.status_code} - {response.text}")
-                    return "Произошла ошибка при транскрибации аудио."
+                async with aiohttp.ClientSession() as session:
+                    data = aiohttp.FormData()
+                    data.add_field('file', audio, filename='audio.mp3', content_type='audio/mpeg')
+                    data.add_field('model', 'whisper-1')
+                    data.add_field('language', language)
+                    data.add_field('response_format', 'text')
+                    
+                    async with session.post(
+                        f"{self.base_url}/audio/transcriptions",
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                        data=data
+                    ) as response:
+                        if response.status == 200:
+                            return await response.text()
+                        else:
+                            error_text = await response.text()
+                            logger.error(f"Ошибка Whisper API: {response.status} - {error_text}")
+                            return "Не удалось распознать аудио."
+                            
         except Exception as e:
             logger.error(f"Ошибка при транскрибации аудио: {str(e)}")
-            return "Произошла ошибка при обработке аудио файла."
+            return "Произошла ошибка при обработке аудио."
 
     async def _process_audio_file(self, file_path: str, prompt_template: str = None) -> List[str]:
         """Обработка аудио файлов"""
@@ -591,25 +822,26 @@ class OpenAIAPI:
     async def generate_image(self, prompt: str, size: str = "1024x1024", quality: str = "standard", n: int = 1) -> List[str]:
         """Генерация изображений через DALL-E"""
         try:
-            response = requests.post(
-                f"{self.base_url}/images/generations",
-                headers=self.headers,
-                json={
-                    "model": "dall-e-3",
-                    "prompt": prompt,
-                    "n": n,
-                    "size": size,
-                    "quality": quality,
-                    "response_format": "url"
-                }
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                return [image["url"] for image in data["data"]]
-            else:
-                logger.error(f"Ошибка DALL-E API: {response.status_code} - {response.text}")
-                return []
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/images/generations",
+                    headers=self.headers,
+                    json={
+                        "model": "dall-e-3",
+                        "prompt": prompt,
+                        "n": n,
+                        "size": size,
+                        "quality": quality,
+                        "response_format": "url"
+                    }
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return [image["url"] for image in data["data"]]
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"Ошибка DALL-E API: {response.status} - {error_text}")
+                        return []
         except Exception as e:
             logger.error(f"Ошибка при генерации изображения: {str(e)}")
             return []
@@ -618,27 +850,27 @@ class OpenAIAPI:
         """Редактирование изображений через DALL-E"""
         try:
             with open(image_path, 'rb') as image, open(mask_path, 'rb') as mask:
-                response = requests.post(
-                    f"{self.base_url}/images/edits",
-                    headers={"Authorization": f"Bearer {self.api_key}"},
-                    files={
-                        "image": ("image.png", image, "image/png"),
-                        "mask": ("mask.png", mask, "image/png")
-                    },
-                    data={
-                        "prompt": prompt,
-                        "n": n,
-                        "size": size,
-                        "response_format": "url"
-                    }
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    return [image["url"] for image in data["data"]]
-                else:
-                    logger.error(f"Ошибка DALL-E API: {response.status_code} - {response.text}")
-                    return []
+                async with aiohttp.ClientSession() as session:
+                    data = aiohttp.FormData()
+                    data.add_field('image', image, filename='image.png', content_type='image/png')
+                    data.add_field('mask', mask, filename='mask.png', content_type='image/png')
+                    data.add_field('prompt', prompt)
+                    data.add_field('n', str(n))
+                    data.add_field('size', size)
+                    data.add_field('response_format', 'url')
+                    
+                    async with session.post(
+                        f"{self.base_url}/images/edits",
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                        data=data
+                    ) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            return [image["url"] for image in data["data"]]
+                        else:
+                            error_text = await response.text()
+                            logger.error(f"Ошибка DALL-E API: {response.status} - {error_text}")
+                            return []
         except Exception as e:
             logger.error(f"Ошибка при редактировании изображения: {str(e)}")
             return []
@@ -647,23 +879,25 @@ class OpenAIAPI:
         """Создание вариаций изображения через DALL-E"""
         try:
             with open(image_path, 'rb') as image:
-                response = requests.post(
-                    f"{self.base_url}/images/variations",
-                    headers={"Authorization": f"Bearer {self.api_key}"},
-                    files={"image": ("image.png", image, "image/png")},
-                    data={
-                        "n": n,
-                        "size": size,
-                        "response_format": "url"
-                    }
-                )
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    return [image["url"] for image in data["data"]]
-                else:
-                    logger.error(f"Ошибка DALL-E API: {response.status_code} - {response.text}")
-                    return []
+                async with aiohttp.ClientSession() as session:
+                    data = aiohttp.FormData()
+                    data.add_field('image', image, filename='image.png', content_type='image/png')
+                    data.add_field('n', str(n))
+                    data.add_field('size', size)
+                    data.add_field('response_format', 'url')
+                    
+                    async with session.post(
+                        f"{self.base_url}/images/variations",
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                        data=data
+                    ) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            return [image["url"] for image in data["data"]]
+                        else:
+                            error_text = await response.text()
+                            logger.error(f"Ошибка DALL-E API: {response.status} - {error_text}")
+                            return []
         except Exception as e:
             logger.error(f"Ошибка при создании вариации изображения: {str(e)}")
             return []
@@ -684,14 +918,18 @@ class OpenAIAPI:
                     }
                 ) as response:
                     if response.status == 200:
-                        return await response.read()
+                        audio_data = await response.read()
+                        logger.info(f"✅ TTS успешно: {len(audio_data)} байт для голоса {voice}")
+                        return audio_data
                     else:
                         error_text = await response.text()
-                        logger.error(f"Ошибка TTS API: {response.status} - {error_text}")
-                        return None
+                        logger.error(f"❌ Ошибка TTS API: {response.status} - {error_text}")
+                        # Возвращаем пустые байты вместо None
+                        return b""
         except Exception as e:
-            logger.error(f"Ошибка при генерации речи: {str(e)}")
-            return None
+            logger.error(f"❌ Критическая ошибка TTS: {str(e)}")
+            # Возвращаем пустые байты вместо None
+            return b""
 
     async def realtime_voice_chat(self, text: str, voice: str = "alloy") -> bytes:
         """Real-time голосовой чат через WebSocket"""
@@ -850,7 +1088,6 @@ class OpenAIAPI:
                         "max_tokens": 1000  # Увеличено для более детального анализа
                     }
                 ) as response:
-            
                     if response.status == 200:
                         data = await response.json()
                         return data["choices"][0]["message"]["content"]
@@ -860,4 +1097,72 @@ class OpenAIAPI:
                         return "Произошла ошибка при анализе изображения."
         except Exception as e:
             logger.error(f"Ошибка при анализе изображения: {str(e)}")
-            return "Произошла ошибка при анализе изображения." 
+            return "Произошла ошибка при анализе изображения."
+
+    # Добавляем новый метод для получения embeddings
+    async def get_text_embedding(self, text: str, model: str = "text-embedding-3-large") -> Optional[List[float]]:
+        """
+        Получение text embedding для семантического анализа
+        """
+        try:
+            if not self.semantic_search_enabled:
+                logger.warning("Семантический поиск недоступен")
+                return None
+            
+            return await semantic_search_api.get_embedding(text, use_cache=True)
+            
+        except Exception as e:
+            logger.error(f"Ошибка получения embedding: {e}")
+            return None
+
+    # Добавляем метод для очистки кэша embeddings
+    async def clear_embedding_cache(self):
+        """Очистка кэша embeddings"""
+        try:
+            if self.semantic_search_enabled:
+                await semantic_search_api.clear_cache()
+                logger.info("🧹 Кэш embeddings очищен")
+        except Exception as e:
+            logger.error(f"Ошибка очистки кэша: {e}")
+
+    # Остальные методы остаются без изменений...
+    async def _make_api_request(self, messages: List[Dict[str, str]]) -> str:
+        """Выполнение запроса к OpenAI API"""
+        try:
+            # Ограничиваем историю для экономии токенов
+            if len(messages) > 20:
+                # Оставляем системное сообщение + последние 18 сообщений
+                system_msg = [msg for msg in messages if msg.get("role") == "system"]
+                recent_msgs = [msg for msg in messages if msg.get("role") != "system"][-18:]
+                messages = system_msg + recent_msgs
+
+            data = {
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": self.max_tokens,
+                "temperature": self.temperature,
+                "stream": False
+            }
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/chat/completions",
+                    headers=self.headers,
+                    json=data,
+                    timeout=aiohttp.ClientTimeout(total=60)
+                ) as response:
+                    
+                    if response.status == 200:
+                        result = await response.json()
+                        return result['choices'][0]['message']['content']
+                    else:
+                        error_text = await response.text()
+                        logger.error(f"OpenAI API error {response.status}: {error_text}")
+                        return f"Ошибка API: {response.status}"
+                        
+        except asyncio.TimeoutError:
+            logger.error("Таймаут запроса к OpenAI API")
+            return "Извините, запрос занял слишком много времени."
+        except Exception as e:
+            logger.error(f"Ошибка при запросе к OpenAI API: {e}")
+            return "Извините, произошла ошибка при обращении к ИИ." 

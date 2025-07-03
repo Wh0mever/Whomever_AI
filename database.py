@@ -118,7 +118,7 @@ class Database:
             FOREIGN KEY (user_id) REFERENCES users(user_id)
         )
         ''')
-
+        
         await conn.commit()
 
     async def add_user(self, user_id: int, username: str = None, first_name: str = None, last_name: str = None):
@@ -159,8 +159,8 @@ class Database:
         async with aiosqlite.connect(self.db_path) as conn:
             cursor = await conn.execute('''
             SELECT current_character, communication_style, analysis_depth, language, is_founder
-            FROM users WHERE user_id = ?
-            ''', (user_id,))
+        FROM users WHERE user_id = ?
+        ''', (user_id,))
             return await cursor.fetchone()
 
     async def update_user_settings(self, user_id: int, **settings):
@@ -411,7 +411,7 @@ class Database:
                 SELECT COUNT(*) as total_messages,
                        COUNT(DISTINCT user_id) as total_users,
                        COUNT(DISTINCT chat_id) as total_chats
-                FROM chat_history
+        FROM chat_history 
                 ''')
                 row = await cursor.fetchone()
                 stats['global'] = dict(zip([d[0] for d in cursor.description], row))

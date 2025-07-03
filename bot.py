@@ -6,6 +6,7 @@ from aiogram.types import (
 )
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 from config import (
     TELEGRAM_BOT_TOKEN, CHARACTERS, COMMUNICATION_STYLES, ANALYSIS_DEPTH,
     MAX_FILE_SIZE, ALLOWED_FILE_TYPES, FILE_UPLOAD_DIR, TEMP_DIR,
@@ -24,9 +25,21 @@ import os
 import mimetypes
 import time
 import re
-from datetime import datetime
-from typing import List, Dict, Optional, Set
+from datetime import datetime, timedelta
+from typing import List, Dict, Optional, Set, Any
 import json
+import pytz
+
+# НОВЫЙ ИМПОРТ: Семантический поиск с embeddings!
+try:
+    from semantic_search_api import semantic_search_api
+    SEMANTIC_SEARCH_AVAILABLE = True
+    logger = logging.getLogger(__name__)
+    logger.info("🧠 Семантический поиск с text-embedding-3-large подключен к боту!")
+except ImportError:
+    SEMANTIC_SEARCH_AVAILABLE = False
+    logger = logging.getLogger(__name__)
+    logger.warning("⚠️ Семантический поиск недоступен - используется базовый поиск")
 
 # Создаем необходимые директории
 os.makedirs(FILE_UPLOAD_DIR, exist_ok=True)
@@ -265,11 +278,23 @@ class ContextManager:
             topic_messages = []
             
             for msg in reversed(history):
-                sender = msg['first_name'] or msg['username'] or 'Анонимный'
-                if msg['is_founder']:
+                # Защита от None
+                if not msg:
+                    continue
+                    
+                # Безопасное получение данных с fallback
+                first_name = msg.get('first_name') or ""
+                username = msg.get('username') or ""
+                sender = first_name or username or 'Анонимный'
+                
+                # Добавляем маркер для основателя
+                if msg.get('is_founder'):
                     sender += " (Founder)"
                 
-                message_text = msg['message_text'][:100]
+                # Безопасное получение текста сообщения
+                message_text = (msg.get('message_text') or "")[:100]
+                if not message_text.strip():
+                    continue  # Пропускаем пустые сообщения
                 
                 # Определяем тему сообщения
                 topics = self.extract_topics(message_text)
@@ -281,14 +306,15 @@ class ContextManager:
                         conversations.append({
                             'topic': current_topic,
                             'messages': topic_messages[:3],  # Берем последние 3
-                            'participants': set(msg.get('sender', sender) for msg in topic_messages)
+                            'participants': set(msg_data.get('sender', 'Анонимный') for msg_data in topic_messages)
                         })
                     current_topic = msg_topic
                     topic_messages = []
                 
+                # Добавляем сообщение в правильном формате
                 topic_messages.append({
                     'sender': sender,
-                    'text': message_text
+                    'text': message_text  # Используем 'text' для совместимости
                 })
             
             # Добавляем последнюю тему
@@ -296,21 +322,25 @@ class ContextManager:
                 conversations.append({
                     'topic': current_topic,
                     'messages': topic_messages[:3],
-                    'participants': set(msg.get('sender', 'Анонимный') for msg in topic_messages)
+                    'participants': set(msg_data.get('sender', 'Анонимный') for msg_data in topic_messages)
                 })
             
             # Форматируем контекст
             history_parts = []
             for conv in conversations[-3:]:  # Последние 3 темы
+                if not conv or not conv.get('participants'):
+                    continue
+                    
                 participants_str = ", ".join(list(conv['participants'])[:4])
                 topic_summary = f"🗣️ {conv['topic'].title()}"
                 if len(conv['participants']) > 1:
                     topic_summary += f" (участвуют: {participants_str})"
                 
-                # Добавляем ключевые сообщения
+                # Добавляем ключевые сообщения с защитой от None
                 key_messages = []
-                for msg in conv['messages'][-2:]:  # Последние 2 сообщения темы
-                    key_messages.append(f"  {msg['sender']}: {msg['text']}...")
+                for msg_data in conv['messages'][-2:]:  # Последние 2 сообщения темы
+                    if msg_data and msg_data.get('sender') and msg_data.get('text'):
+                        key_messages.append(f"  {msg_data['sender']}: {msg_data['text']}...")
                 
                 if key_messages:
                     topic_summary += "\n" + "\n".join(key_messages)
@@ -576,6 +606,9 @@ class ContextManager:
         try:
             profile = await self.db.get_user_chat_profile(chat_id, user_id) or {}
             
+            # Защита от None
+            message_text = message_text or ""
+            
             # Анализ стиля общения
             patterns = profile.get('communication_patterns', {})
             
@@ -596,8 +629,8 @@ class ContextManager:
             formal_indicators = ['пожалуйста', 'благодарю', 'извините', 'уважаемый']
             informal_indicators = ['привет', 'хай', 'круто', 'класс', 'ок']
             
-            formal_score = sum(1 for indicator in formal_indicators if indicator in (message_text or '').lower())
-            informal_score = sum(1 for indicator in informal_indicators if indicator in (message_text or '').lower())
+            formal_score = sum(1 for indicator in formal_indicators if indicator in message_text.lower())
+            informal_score = sum(1 for indicator in informal_indicators if indicator in message_text.lower())
             
             formal_style = formal_score > informal_score
             
@@ -611,7 +644,7 @@ class ContextManager:
                 'message_count': message_count + 1,
                 'uses_emoji': uses_emoji,
                 'formal_style': formal_style,
-                'emoji_frequency': patterns.get('emoji_frequency', 0) * 0.9 + (emoji_count / max(len(message_text or ''), 1)) * 0.1,
+                'emoji_frequency': patterns.get('emoji_frequency', 0) * 0.9 + (emoji_count / max(len(message_text), 1)) * 0.1,
                 'time_patterns': time_patterns
             })
             
@@ -692,13 +725,14 @@ class TelegramBot:
         self.dp.message.register(self.autonomous_command, Command("autonomous"))
         self.dp.message.register(self.reasoning_command, Command("reasoning"))
         
+        # БЫСТРАЯ КОМАНДА ДЛЯ ВРЕМЕНИ
+        self.dp.message.register(self.time_command, Command("время"))
+        self.dp.message.register(self.time_command, Command("time"))
+        
         # Обработчики кнопок
         self.dp.callback_query.register(self.button)
         
-        # Обработчик текстовых сообщений (включая групповые)
-        self.dp.message.register(self.handle_message, ~F.text.startswith('/'))
-        
-        # Обработчики файлов
+        # ВАЖНО! Обработчики файлов ДОЛЖНЫ быть ПЕРЕД текстовыми!
         self.dp.message.register(self.handle_document, F.document)
         self.dp.message.register(self.handle_photo, F.photo)
         self.dp.message.register(self.handle_voice, F.voice)
@@ -706,7 +740,11 @@ class TelegramBot:
         self.dp.message.register(self.handle_video, F.video)
         self.dp.message.register(self.handle_audio, F.audio)
         
-
+        # Обработчик текстовых сообщений (исключаем сообщения с файлами!)
+        self.dp.message.register(self.handle_message, 
+                                (~F.text.startswith('/')) & 
+                                (~F.photo) & (~F.document) & (~F.voice) & 
+                                (~F.video) & (~F.video_note) & (~F.audio))
 
         # Обработчики состояний для генерации изображений
         self.dp.message.register(self.process_image_prompt, ImageGenStates.waiting_for_prompt)
@@ -776,6 +814,11 @@ class TelegramBot:
         try:
             # История уже сохраняется в handle_message, здесь только проверяем нужно ли отвечать
             
+            # ВСЕГДА отвечаем на файлы (изображения, документы, аудио, видео)
+            if (message.photo or message.document or message.voice or 
+                message.audio or message.video or message.video_note):
+                return True
+            
             # Проверяем наличие ключевых слов WHOMEVER
             if self.is_whomever_call(message.text):
                 return True
@@ -791,7 +834,7 @@ class TelegramBot:
             if message.reply_to_message and message.reply_to_message.from_user.id == self.bot.id:
                 return True
             
-            # НЕ отвечаем на обычные сообщения
+            # НЕ отвечаем на обычные текстовые сообщения
             return False
             
         except Exception as e:
@@ -1235,27 +1278,56 @@ class TelegramBot:
             await message.answer("Произошла ошибка при переключении автономного режима.")
     
     async def reasoning_command(self, message: Message) -> None:
-        """Команда /reasoning - статистика и управление рассуждениями"""
+        """Команда для демонстрации O3/O4 reasoning"""
+        await message.answer(
+            "🧠 **O3/O4-mini Reasoning Models**\n\n"
+            "Эти модели способны на:\n"
+            "• Многошаговые рассуждения\n"
+            "• Автономное решение сложных задач\n"
+            "• Самостоятельный выбор инструментов\n\n"
+            "Попробуйте отправить сложную задачу для анализа!"
+        )
+    
+    async def time_command(self, message: Message) -> None:
+        """БЫСТРАЯ команда для получения времени"""
         try:
-            stats = self.reasoning_engine.get_reasoning_stats()
+            # Получаем время в разных часовых поясах
+            moscow_tz = pytz.timezone('Europe/Moscow')
+            utc_now = datetime.utcnow()
+            moscow_time = utc_now.replace(tzinfo=pytz.UTC).astimezone(moscow_tz)
             
-            response = "🧠 *Статистика рассуждений*\n\n"
-            response += f"📊 Всего сессий: {stats['total_sessions']}\n"
-            response += f"🔄 Активных сессий: {stats['active_sessions']}\n\n"
+            response = f"🕐 **АКТУАЛЬНОЕ ВРЕМЯ**\n\n"
+            response += f"🇷🇺 **Москва (МСК):** {moscow_time.strftime('%H:%M:%S')}\n"
+            response += f"📅 **Дата:** {moscow_time.strftime('%d.%m.%Y')}\n"
+            response += f"📋 **День недели:** {moscow_time.strftime('%A')}\n\n"
             
-            response += "🛠️ *Использование инструментов:*\n"
-            for tool, count in stats['tool_usage'].items():
-                response += f"• {tool}: {count} раз\n"
+            # Добавляем UTC для справки
+            response += f"🌍 **UTC:** {utc_now.strftime('%H:%M:%S')}"
             
-            response += f"\n🤖 *Модели:*\n"
-            response += f"• O3: {stats['models_used']['o3']} сессий\n"
-            response += f"• O4-mini: {stats['models_used']['o4_mini']} сессий\n"
+            await message.answer(response)
             
-            await message.answer(response, parse_mode="Markdown")
+            # Сохраняем в историю
+            await self.db.add_chat_history(
+                message.chat.id, message.from_user.id, message.message_id,
+                "/время", response, 'default'
+            )
             
         except Exception as e:
-            logger.error(f"Ошибка команды /reasoning: {e}")
-            await message.answer("Произошла ошибка при получении статистики рассуждений.")
+            logger.error(f"Ошибка команды времени: {e}")
+            
+            # FALLBACK: пытаемся через семантический поиск
+            try:
+                search_results = await self.perform_semantic_search("текущее время москва сейчас", max_results=3)
+                if search_results:
+                    response = "🔍 **ВРЕМЯ ИЗ ИНТЕРНЕТА:**\n\n"
+                    for i, result in enumerate(search_results[:2], 1):
+                        response += f"{i}. **{result.get('title', 'Время')}**\n"
+                        response += f"📝 {result.get('description', '')}\n\n"
+                    await message.answer(response)
+                else:
+                    await message.answer("⚠️ Не удалось получить актуальное время. Проверьте подключение к интернету.")
+            except:
+                await message.answer("⚠️ Не удалось получить актуальное время. Проверьте подключение к интернету.")
     
     # === ОБРАБОТЧИКИ СОСТОЯНИЙ ===
     
@@ -1535,68 +1607,150 @@ class TelegramBot:
         )
 
     async def search(self, message: types.Message) -> None:
-        """Обработка команды поиска"""
-        query = (message.text or '').replace('/search', '').strip()
-        if not query:
-            await message.answer(
-                "Пожалуйста, укажите поисковый запрос после команды /search\n"
-                "Например: /search последние новости технологий"
-            )
+        """Команда поиска в интернете с СЕМАНТИЧЕСКИМ ПОИСКОМ"""
+        search_text = message.text.replace('/search', '').strip()
+        
+        if not search_text:
+            await message.answer("❓ Пожалуйста, укажите запрос для поиска.\n\nПример: /search курс биткоина сегодня")
             return
         
-        await self.register_chat_and_user(message)
-        
-        # Проверяем, нужно ли отвечать в групповом чате
-        if self.is_group_chat(message) and not await self.should_respond_in_group(message):
-            return
-        
-        status_message = await message.answer("🔍 Ищу информацию...")
+        # Отправляем статус
+        status_message = await message.answer("🔍 Выполняю семантический поиск...")
         
         try:
-            search_api = SearchAPI()
+            # НОВАЯ ЛОГИКА: Приоритет семантическому поиску
+            search_results = await self.perform_semantic_search(search_text)
             
-            # Получаем результаты поиска
-            results = await search_api.search(
-                query=query,
-                engine='duckduckgo'
-            )
-            
-            if not results:
+            if not search_results:
                 await status_message.edit_text("К сожалению, по вашему запросу ничего не найдено. Попробуйте изменить запрос.")
                 return
             
-            # Форматируем результаты
-            response_text = "🔍 Результаты поиска:\n\n"
-            for i, result in enumerate(results[:5], 1):
-                response_text += (
-                    f"{i}. {result['title']}\n"
-                    f"📎 {result['url']}\n"
-                    f"📝 {result['description']}\n\n"
-                )
+            # Форматируем результаты с семантической релевантностью
+            response_text = self._format_semantic_search_results(search_results, search_text)
             
             await status_message.edit_text(response_text)
             
             # Сохраняем в историю
             await self.db.add_chat_history(
                 message.chat.id, message.from_user.id, message.message_id,
-                f"🔍 Поиск: {query}", response_text, 'default'
+                f"🔍 Семантический поиск: {search_text}", response_text, 'default'
             )
             
-            # Получаем поисковые подсказки
-            try:
-                suggestions = await search_api.get_suggestions(query)
-                if suggestions:
-                    suggest_text = "💡 Похожие запросы:\n"
-                    for suggestion in suggestions[:5]:
-                        suggest_text += f"• {suggestion['keyword']}\n"
-                    await message.answer(suggest_text)
-            except Exception as e:
-                logger.warning(f"Ошибка при получении подсказок: {str(e)}")
+        except Exception as e:
+            logger.error(f"Ошибка семантического поиска: {str(e)}")
+            await status_message.edit_text("Произошла ошибка при выполнении поиска. Попробуйте позже.")
+
+    async def perform_semantic_search(self, query: str, max_results: int = 6) -> List[Dict]:
+        """
+        Выполнение семантического поиска с fallback на обычный поиск
+        
+        Возможности:
+        - text-embedding-3-large для максимальной точности
+        - Автоматическое определение типа запроса (новости, технические, общие)
+        - Ранжирование по семантической релевантности
+        - Fallback на DuckDuckGo при недоступности embeddings
+        """
+        try:
+            logger.info(f"🧠 Выполняю семантический поиск: '{query}'")
+            
+            # ПРИОРИТЕТ: Семантический поиск если доступен
+            if SEMANTIC_SEARCH_AVAILABLE:
+                try:
+                    semantic_results = await semantic_search_api.semantic_search(
+                        query=query,
+                        max_results=max_results,
+                        include_news=True
+                    )
+                    
+                    if semantic_results:
+                        logger.info(f"✅ Семантический поиск успешен: {len(semantic_results)} результатов")
+                        return semantic_results
+                    else:
+                        logger.warning("⚠️ Семантический поиск не дал результатов")
+                        
+                except Exception as e:
+                    logger.error(f"Ошибка семантического поиска: {e}")
+            
+            # FALLBACK: Обычный поиск через SearchAPI
+            logger.info("🔄 Переходим к обычному поиску...")
+            search_api = SearchAPI()
+            
+            fallback_results = await search_api.search(
+                query=query,
+                engine='duckduckgo'
+            )
+            
+            if fallback_results:
+                # Добавляем базовые метрики релевантности для fallback
+                for i, result in enumerate(fallback_results):
+                    result['semantic_score'] = 1.0 - (i * 0.15)  # Убывающая релевантность
+                    result['cosine_similarity'] = 0.7 - (i * 0.1)
+                    result['search_method'] = 'fallback_duckduckgo'
+                
+                logger.info(f"✅ Обычный поиск: {len(fallback_results)} результатов")
+                return fallback_results
+            else:
+                logger.warning("❌ Ни один метод поиска не дал результатов")
+                return []
                 
         except Exception as e:
-            error_message = f"Ошибка при поиске: {str(e)}"
-            logger.error(error_message)
-            await status_message.edit_text("Извините, произошла ошибка при выполнении поиска. Попробуйте позже.")
+            logger.error(f"Критическая ошибка поиска: {e}")
+            return []
+
+    def _format_semantic_search_results(self, results: List[Dict], original_query: str) -> str:
+        """Форматирование результатов семантического поиска с метриками релевантности"""
+        try:
+            if not results:
+                return "Результаты не найдены."
+            
+            # Заголовок с информацией о типе поиска
+            search_method = results[0].get('search_method', 'semantic_embedding')
+            if search_method == 'semantic_embedding':
+                header = f"🧠 **СЕМАНТИЧЕСКИЙ ПОИСК** для: '{original_query}'\n"
+                header += "✨ Результаты ранжированы по семантической релевантности с помощью text-embedding-3-large\n\n"
+            else:
+                header = f"🔍 **ПОИСК** для: '{original_query}'\n\n"
+            
+            formatted_results = [header]
+            
+            for i, result in enumerate(results[:6], 1):
+                title = result.get('title', 'Без названия')
+                description = result.get('description', 'Описание недоступно')
+                url = result.get('url', '')
+                source = result.get('source', 'Неизвестный источник')
+                
+                # Отображаем метрики релевантности
+                semantic_score = result.get('semantic_score', 0)
+                cosine_similarity = result.get('cosine_similarity', 0)
+                
+                # Выбираем эмодзи по релевантности
+                if semantic_score > 0.8:
+                    relevance_emoji = "🎯"
+                elif semantic_score > 0.6:
+                    relevance_emoji = "📍"
+                else:
+                    relevance_emoji = "📌"
+                
+                result_text = f"{relevance_emoji} **Результат {i}**"
+                
+                # Показываем метрики только для семантического поиска
+                if search_method == 'semantic_embedding':
+                    result_text += f" (релевантность: {semantic_score:.2f})"
+                
+                result_text += f"\n📰 **{title}**\n"
+                result_text += f"📝 {description}\n"
+                result_text += f"🔗 {source}\n"
+                
+                if url:
+                    result_text += f"💻 {url}\n"
+                
+                formatted_results.append(result_text)
+            
+            return "\n".join(formatted_results)
+            
+        except Exception as e:
+            logger.error(f"Ошибка форматирования результатов: {e}")
+            return f"Найдено {len(results)} результатов, но произошла ошибка форматирования."
 
     async def show_character_selection(self, message: Message | types.CallbackQuery) -> None:
         keyboard = []
@@ -1751,9 +1905,11 @@ class TelegramBot:
                 text_response = text_response[:3000] + "..."
             
             # Генерируем голосовой ответ
+            logger.info(f"🎤 Генерирую голосовое сообщение голосом {user_voice_preference}")
             audio_data = await self.api.text_to_speech(text_response, voice=user_voice_preference)
             
-            if audio_data:
+            # Проверяем, что TTS вернул валидные данные (не None и не пустые)
+            if audio_data is not None and len(audio_data) > 0:
                 # Сохраняем во временный файл
                 audio_file_path = os.path.join(TEMP_DIR, f"voice_{message.from_user.id}_{int(time.time())}.mp3")
                 with open(audio_file_path, 'wb') as f:
@@ -1766,12 +1922,26 @@ class TelegramBot:
                 # Удаляем временный файл
                 os.remove(audio_file_path)
                 
+                logger.info(f"✅ Голосовое сообщение отправлено успешно!")
                 return True
             else:
+                logger.warning(f"⚠️ TTS не сгенерировал аудио данные - отправляю текстовый ответ")
+                # Отправляем обычное сообщение о недоступности голосовых ответов
+                await message.answer(
+                    "К сожалению, сейчас я не могу отправлять голосовые сообщения напрямую в этом чате.\n"
+                    "Но если вам нужно, я могу подготовить текст для голосового сообщения — вы сможете легко озвучить его сами или использовать любой голосовой генератор.\n\n"
+                    "Если появится техническая возможность отправлять войс — сразу сообщу!\n"
+                    "Если нужна помощь с подготовкой или записью текста — дайте знать."
+                )
                 return False
                 
         except Exception as e:
-            logger.error(f"Ошибка отправки голосового ответа: {e}")
+            logger.error(f"❌ Критическая ошибка отправки голосового ответа: {e}")
+            # Отправляем сообщение об ошибке
+            await message.answer(
+                "❌ Произошла ошибка при создании голосового ответа.\n"
+                "Попробуйте ещё раз или воспользуйтесь текстовым режимом."
+            )
             return False
 
     async def toggle_voice_responses(self, user_id: int) -> bool:
@@ -1930,10 +2100,18 @@ class TelegramBot:
         await self.context_manager.update_context(chat_id, user_id, message_text, response)
         
         # Проверяем, нужно ли отправить голосовой ответ
-        if user_id in self.voice_enabled_users and len(response) < 1000:
+        is_voice_call = self.is_voice_call(message.text)
+        should_send_voice = (
+            user_id in self.voice_enabled_users or  # Включены голосовые ответы
+            is_voice_call  # Или команда !voice / !ГОЛОС
+        )
+        
+        if should_send_voice and len(response) < 1000:
             voice_sent = await self.send_voice_response(message, response)
             if voice_sent:
-                await self._send_formatted_message(message, f"📝 {response}\n\n🎤 <i>Голосовой ответ отправлен выше</i>")
+                # Для !voice команд НЕ дублируем текстом - только голос
+                if not is_voice_call:
+                    await self._send_formatted_message(message, f"📝 {response}\n\n🎤 <i>Голосовой ответ отправлен выше</i>")
             else:
                 await self._send_formatted_message(message, response)
         else:

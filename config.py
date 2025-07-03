@@ -36,6 +36,11 @@ OPENAI_MODELS = {
     'vision': 'gpt-4.1-2025-04-14'  # GPT-4.1 Vision
 }
 
+# Основные настройки OpenAI API
+OPENAI_MODEL = 'gpt-4.1-2025-04-14'  # Модель по умолчанию
+OPENAI_MAX_TOKENS = 4096  # Максимальное количество токенов в ответе
+OPENAI_TEMPERATURE = 0.7  # Температура генерации (0.0 - 1.0)
+
 # Realtime Voice API Settings
 REALTIME_VOICE_SETTINGS = {
     'enabled': True,

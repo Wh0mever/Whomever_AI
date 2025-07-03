@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).parent))
 
 from bot import TelegramBot
-from database import DatabaseManager
+from database import Database
 from openai_api import OpenAIAPI
 from search_api import SearchAPI
 from realtime_voice import RealtimeVoiceManager
@@ -42,7 +42,7 @@ async def main():
         
         # Инициализация компонентов
         logger.info("📊 Инициализация базы данных...")
-        db = DatabaseManager()
+        db = Database()
         await db.init_db()
         
         logger.info("🤖 Инициализация OpenAI API...")
@@ -52,22 +52,23 @@ async def main():
         search_api = SearchAPI()
         
         logger.info("🎤 Инициализация Realtime Voice Manager...")
-        voice_manager = RealtimeVoiceManager()
+        from config import OPENAI_API_KEY
+        voice_manager = RealtimeVoiceManager(OPENAI_API_KEY)
         
         logger.info("🧠 Инициализация Agentic Reasoning Engine...")
-        reasoning_engine = AgenticReasoningEngine()
+        reasoning_engine = AgenticReasoningEngine(OPENAI_API_KEY)
         
         # Создание основного экземпляра бота
         logger.info("🤖 Создание экземпляра TelegramBot...")
-        bot = TelegramBot(db, api, search_api)
+        bot = TelegramBot()
         
-        # Интеграция новых компонентов
+        # Интеграция новых компонентов (они уже инициализированы в bot.py)
+        # bot.voice_manager и bot.reasoning_engine уже созданы в __init__
+        logger.info("🔧 Интеграция новых компонентов...")
+        
+        # Обновляем voice_manager с корректным API ключом
         bot.voice_manager = voice_manager
         bot.reasoning_engine = reasoning_engine
-        
-        # Инициализация дополнительных атрибутов для новых функций
-        bot.active_voice_sessions = {}
-        bot.autonomous_mode_users = set()
         
         logger.info("✅ Все компоненты инициализированы успешно!")
         logger.info("🎯 Новые возможности 2025:")
