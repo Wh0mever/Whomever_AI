@@ -1,0 +1,66 @@
+# Зависимости для WHOMEVER бота - Linux VPS версия
+# Основные зависимости
+aiogram>=3.0.0
+aiohttp>=3.8.0
+openai>=1.55.0
+python-dotenv>=0.19.0
+aiofiles>=23.1.0
+aiosqlite>=0.19.0
+typing-extensions>=4.7.0
+
+# Обработка файлов - Linux версии
+PyMuPDF>=1.24.0
+PyPDF2>=3.0.0
+python-docx>=0.8.11
+Pillow>=10.0.0
+python-magic>=0.4.27
+# НЕТ python-magic-bin для Linux - используется системная libmagic
+
+# Аудио/видео обработка для Linux
+pydub>=0.25.1
+soundfile>=0.12.1
+sounddevice>=0.5.1
+ffmpeg-python>=0.2.0
+# НЕТ pyaudio для Linux VPS - используем soundfile/sounddevice
+
+# WebSocket для Real-time API
+websockets>=12.0
+websocket-client>=1.6.4
+
+# Веб-парсинг и поиск
+beautifulsoup4>=4.12.0
+lxml>=5.0.0
+duckduckgo-search>=6.0.0
+
+# Семантический поиск и embeddings
+scikit-learn>=1.5.0
+numpy>=1.24.0
+scipy>=1.11.0
+
+# Дополнительные утилиты
+cachetools>=5.3.0
+yarl>=1.9.2
+backoff>=2.2.0
+requests>=2.31.0
+
+# Безопасность
+cryptography>=41.0.0
+pydantic>=2.0.0
+
+# JSON обработка
+jsonschema>=4.18.0
+orjson>=3.9.0
+
+# Асинхронность - uvloop для Linux для лучшей производительности
+uvloop>=0.17.0
+asyncio-throttle>=1.0.2
+
+# Мониторинг
+psutil>=5.9.0
+structlog>=23.1.0
+
+# Работа с временем
+pytz>=2024.1
+
+# Системные зависимости Linux (должны быть установлены через apt)
+# sudo apt-get install -y ffmpeg libmagic1 libmagic-dev python3-dev build-essential 
